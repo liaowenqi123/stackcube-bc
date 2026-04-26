@@ -1,0 +1,6 @@
+{
+  "success_rate": 0.82,
+  "avg_return": 20.057603101432324,
+  "avg_ep_len": 86.24,
+  "episodes": 50
+}

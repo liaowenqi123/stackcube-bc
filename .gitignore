@@ -1,0 +1,22 @@
+# ManiSkill downloaded assets (re-downloadable via scripts)
+data/raw/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+
+# Torch hub cache
+.pt hub/
+
+# WorkBuddy AI working memory
+.workbuddy/
+
+# OS
+.DS_Store/
+Thumbs.db
+
+# Misc
+*.log
+*.tmp
