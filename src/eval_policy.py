@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import deque
 from pathlib import Path
 
 import gymnasium as gym
@@ -12,7 +13,7 @@ import torch
 import mani_skill.envs  # noqa: F401
 
 from common import RunningNormalizer, select_device
-from models import BCMLP, BCRNN, BCDiffusion
+from models import BCMLP, BCRNN, BCDiffusion, BCDiffusionTemporal
 
 
 def flatten_obs(obs) -> np.ndarray:
@@ -89,20 +90,41 @@ def main() -> None:
         # 从 checkpoint 自动检测模型参数
         # v1: hidden=256, depth=4, linear (默认)
         # v2: hidden=384, depth=6, cosine
-        stored_scheduler = str(ckpt.get("scheduler", "linear"))
-        stored_depth    = int(ckpt.get("depth", 4))
-        stored_hidden   = int(ckpt.get("hidden", 256))
+        stored_scheduler_raw = ckpt.get("scheduler", "linear")
+        stored_depth_raw = ckpt.get("depth", 4)
+        stored_hidden_raw = ckpt.get("hidden", 256)
+        stored_scheduler = str(stored_scheduler_raw) if stored_scheduler_raw is not None else "linear"
+        stored_depth = int(stored_depth_raw) if stored_depth_raw is not None else 4
+        stored_hidden = int(stored_hidden_raw) if stored_hidden_raw is not None else 256
+        is_temporal = bool(ckpt.get("temporal", False)) or str(ckpt.get("algo", "")).startswith("diffusion_temporal")
 
-        model = BCDiffusion(
-            obs_dim    = obs_dim,
-            act_dim    = act_dim,
-            T          = int(ckpt.get("T",        100)),
-            beta_min   = float(ckpt.get("beta_min", 1e-4)),
-            beta_max   = float(ckpt.get("beta_max", 2e-2)),
-            hidden     = stored_hidden,
-            depth      = stored_depth,
-            scheduler  = stored_scheduler,
-        ).to(device)
+        if is_temporal:
+            model = BCDiffusionTemporal(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                T=int(ckpt.get("T", 100)),
+                beta_min=float(ckpt.get("beta_min", 1e-4)),
+                beta_max=float(ckpt.get("beta_max", 2e-2)),
+                hidden=stored_hidden,
+                depth=stored_depth,
+                scheduler=stored_scheduler,
+                seq_len=int(ckpt.get("seq_len", 8)),
+                tf_layers=int(ckpt.get("tf_layers", 2)),
+                tf_heads=int(ckpt.get("tf_heads", 4)),
+                tf_dropout=float(ckpt.get("tf_dropout", 0.1)),
+                router_hidden=int(ckpt.get("router_hidden", 128)),
+            ).to(device)
+        else:
+            model = BCDiffusion(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                T=int(ckpt.get("T", 100)),
+                beta_min=float(ckpt.get("beta_min", 1e-4)),
+                beta_max=float(ckpt.get("beta_max", 2e-2)),
+                hidden=stored_hidden,
+                depth=stored_depth,
+                scheduler=stored_scheduler,
+            ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -147,12 +169,14 @@ def main() -> None:
             ret = 0.0
             t = 0
             h = None
+            obs_hist = deque(maxlen=getattr(model, "seq_len", 1))
             frames = []
             while not done and not trunc:
                 o = _preprocess_obs(obs, raw_obs_dim)
                 if o.shape[0] != obs_dim:
                     raise RuntimeError(f"obs dim mismatch after norm: got {o.shape[0]} expected {obs_dim}")
                 ot = torch.from_numpy(o).to(device).unsqueeze(0)
+                obs_hist.append(o)
                 if args.algo == "bc":
                     at = model(ot).squeeze(0)
                 elif args.algo == "bcrnn":
@@ -160,10 +184,27 @@ def main() -> None:
                     at = at.squeeze(0).squeeze(0)
                 else:  # diffusion
                     # 支持 DDPM / DDIM 两种采样器
-                    if args.sampler == "ddim":
-                        at = model.ddim_sample(ot, T_inf=args.T_inf or 20, eta=args.eta).squeeze(0)
+                    if isinstance(model, BCDiffusionTemporal):
+                        seq_len = model.seq_len
+                        seq_np = np.zeros((seq_len, obs_dim), dtype=np.float32)
+                        mask_np = np.zeros((seq_len,), dtype=np.bool_)
+                        hist = list(obs_hist)[-seq_len:]
+                        n = len(hist)
+                        seq_np[-n:] = np.stack(hist, axis=0)
+                        mask_np[-n:] = True
+                        seq_t = torch.from_numpy(seq_np).to(device).unsqueeze(0)
+                        mask_t = torch.from_numpy(mask_np).to(device).unsqueeze(0)
+                        if args.sampler == "ddim":
+                            at = model.ddim_sample(
+                                ot, obs_seq=seq_t, obs_mask=mask_t, T_inf=args.T_inf or 20, eta=args.eta
+                            ).squeeze(0)
+                        else:
+                            at = model.ddpm_sample(ot, obs_seq=seq_t, obs_mask=mask_t, T_inf=args.T_inf).squeeze(0)
                     else:
-                        at = model.ddpm_sample(ot, T_inf=args.T_inf).squeeze(0)
+                        if args.sampler == "ddim":
+                            at = model.ddim_sample(ot, T_inf=args.T_inf or 20, eta=args.eta).squeeze(0)
+                        else:
+                            at = model.ddpm_sample(ot, T_inf=args.T_inf).squeeze(0)
 
                 # ── 反归一化 action ────────────────────────────────────────
                 action_norm = at.detach().cpu().numpy().astype(np.float32)

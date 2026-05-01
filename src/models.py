@@ -351,7 +351,7 @@ class BCDiffusion(nn.Module):
         obs : (B, obs_dim)
         返回 (B, act_dim) — 归一化空间的 action
         """
-        B       = obs.shape[0]
+        B = obs.shape[0]
         step_size = self.T // T_inf  # 跳步间隔
 
         # 从纯噪声开始
@@ -363,15 +363,14 @@ class BCDiffusion(nn.Module):
             timesteps.append(0)
 
         for idx in range(len(timesteps) - 1):
-            t_cur  = timesteps[idx]
+            t_cur = timesteps[idx]
             t_next = timesteps[idx + 1]
 
             t_batch = torch.full((B,), t_cur, device=obs.device, dtype=torch.long)
-            eps     = self.noise_pred(x, t_batch, obs)
+            eps = self.noise_pred(x, t_batch, obs)
 
-            ab_t    = self.alpha_bar[t_cur]
-            ab_tn   = self.alpha_bar[t_next]
-            alpha_t = self.alphas[t_cur]
+            ab_t = self.alpha_bar[t_cur]
+            ab_tn = self.alpha_bar[t_next]
 
             # DDIM 一步转移
             # x_{t_next} = sqrt(ab_tn) * pred_x0 + sqrt(1-ab_tn) * direction
@@ -390,3 +389,234 @@ class BCDiffusion(nn.Module):
                     x = x + c1 * torch.randn_like(x)
 
         return x
+
+
+class TemporalFusionNoisePredictor(nn.Module):
+    """
+    双分支噪声预测器：
+    1) 单步分支：原始 FiLM-MLP（保持 diffusion 单步建模能力）
+    2) 时序分支：TransformerEncoder 编码 obs 序列
+    3) 路由门控：按样本动态融合两个分支的 eps 预测
+    """
+
+    def __init__(self,
+                 obs_dim: int,
+                 act_dim: int,
+                 hidden: int = 384,
+                 t_dim: int = 64,
+                 depth: int = 6,
+                 seq_len: int = 8,
+                 tf_layers: int = 2,
+                 tf_heads: int = 4,
+                 tf_dropout: float = 0.1,
+                 router_hidden: int = 128):
+        super().__init__()
+        self.seq_len = seq_len
+        self.base_branch = NoisePredictor(
+            obs_dim=obs_dim, act_dim=act_dim, hidden=hidden, t_dim=t_dim, depth=depth
+        )
+
+        self.t_emb = SinusoidalPosEmb(t_dim)
+        self.t_proj = nn.Sequential(
+            nn.Linear(t_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.cur_obs_proj = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.noisy_proj = nn.Sequential(
+            nn.Linear(act_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+
+        self.seq_in = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+        )
+        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, hidden))
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=tf_heads,
+            dim_feedforward=hidden * 4,
+            dropout=tf_dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(enc_layer, num_layers=tf_layers)
+        self.temporal_norm = nn.LayerNorm(hidden)
+
+        self.temporal_head = nn.Sequential(
+            nn.LayerNorm(hidden * 4),
+            nn.Linear(hidden * 4, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, act_dim),
+        )
+        self.router = nn.Sequential(
+            nn.LayerNorm(hidden * 3),
+            nn.Linear(hidden * 3, router_hidden),
+            nn.GELU(),
+            nn.Linear(router_hidden, 1),
+        )
+
+    def _encode_temporal(self, obs_seq: torch.Tensor, obs_mask: torch.Tensor | None) -> torch.Tensor:
+        # obs_seq: (B, L, obs_dim), obs_mask: (B, L) True=valid
+        B, L, _ = obs_seq.shape
+        if L > self.seq_len:
+            obs_seq = obs_seq[:, -self.seq_len:, :]
+            if obs_mask is not None:
+                obs_mask = obs_mask[:, -self.seq_len:]
+            L = self.seq_len
+        if obs_mask is None:
+            obs_mask = torch.ones(B, L, device=obs_seq.device, dtype=torch.bool)
+
+        x = self.seq_in(obs_seq) + self.pos_emb[:, :L, :]
+        x = self.temporal_encoder(x, src_key_padding_mask=~obs_mask)
+        x = self.temporal_norm(x)
+
+        valid_len = obs_mask.long().sum(dim=1).clamp(min=1)
+        last_idx = (valid_len - 1).view(B, 1, 1).expand(-1, 1, x.size(-1))
+        return x.gather(1, last_idx).squeeze(1)  # (B, hidden)
+
+    def forward(self,
+                noisy_act: torch.Tensor,
+                t: torch.Tensor,
+                obs: torch.Tensor,
+                obs_seq: torch.Tensor,
+                obs_mask: torch.Tensor | None = None) -> torch.Tensor:
+        eps_base = self.base_branch(noisy_act, t, obs)
+
+        time_ctx = self.t_proj(self.t_emb(t))
+        obs_ctx = self.cur_obs_proj(obs)
+        temp_ctx = self._encode_temporal(obs_seq, obs_mask)
+        noisy_ctx = self.noisy_proj(noisy_act)
+
+        eps_temp = self.temporal_head(torch.cat([noisy_ctx, obs_ctx, time_ctx, temp_ctx], dim=-1))
+        gate = torch.sigmoid(self.router(torch.cat([obs_ctx, time_ctx, temp_ctx], dim=-1)))
+        return (1.0 - gate) * eps_base + gate * eps_temp
+
+
+class BCDiffusionTemporal(BCDiffusion):
+    """
+    扩展版 Diffusion：多步输入、单步输出。
+    在标准 diffusion 单步分支上，增加 Transformer 时序分支并做路由融合。
+    """
+
+    def __init__(self,
+                 obs_dim: int,
+                 act_dim: int,
+                 T: int = 100,
+                 beta_min: float = 1e-4,
+                 beta_max: float = 2e-2,
+                 hidden: int = 384,
+                 depth: int = 6,
+                 scheduler: str = "cosine",
+                 seq_len: int = 8,
+                 tf_layers: int = 2,
+                 tf_heads: int = 4,
+                 tf_dropout: float = 0.1,
+                 router_hidden: int = 128):
+        super().__init__(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            T=T,
+            beta_min=beta_min,
+            beta_max=beta_max,
+            hidden=hidden,
+            depth=depth,
+            scheduler=scheduler,
+        )
+        self.seq_len = seq_len
+        self.noise_pred = TemporalFusionNoisePredictor(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden=hidden,
+            depth=depth,
+            seq_len=seq_len,
+            tf_layers=tf_layers,
+            tf_heads=tf_heads,
+            tf_dropout=tf_dropout,
+            router_hidden=router_hidden,
+        )
+
+    def forward(self,
+                obs: torch.Tensor,
+                act: torch.Tensor,
+                obs_seq: torch.Tensor,
+                obs_mask: torch.Tensor | None = None,
+                action_noise_std: float = 0.0) -> torch.Tensor:
+        B = obs.shape[0]
+        t = torch.randint(0, self.T, (B,), device=obs.device)
+        if action_noise_std > 0:
+            act = act + torch.randn_like(act) * action_noise_std
+        noise = torch.randn_like(act)
+        x_t = self.q_sample(act, t, noise)
+        eps_pred = self.noise_pred(x_t, t, obs, obs_seq, obs_mask)
+        return torch.nn.functional.mse_loss(eps_pred, noise)
+
+    @torch.no_grad()
+    def ddpm_sample(self,
+                    obs: torch.Tensor,
+                    obs_seq: torch.Tensor,
+                    obs_mask: torch.Tensor | None = None,
+                    T_inf: int | None = None) -> torch.Tensor:
+        T_inf = T_inf or self.T
+        B = obs.shape[0]
+        x = torch.randn(B, self.act_dim, device=obs.device)
+
+        for i in reversed(range(T_inf)):
+            t_batch = torch.full((B,), i, device=obs.device, dtype=torch.long)
+            eps = self.noise_pred(x, t_batch, obs, obs_seq, obs_mask)
+            beta_t = self.betas[i]
+            alpha_t = self.alphas[i]
+            ab_t = self.alpha_bar[i]
+
+            coef = beta_t / (1 - ab_t).sqrt()
+            mean = (x - coef * eps) / alpha_t.sqrt()
+            if i > 0:
+                x = mean + beta_t.sqrt() * torch.randn_like(x)
+            else:
+                x = mean
+        return x
+
+    @torch.no_grad()
+    def ddim_sample(self,
+                    obs: torch.Tensor,
+                    obs_seq: torch.Tensor,
+                    obs_mask: torch.Tensor | None = None,
+                    T_inf: int = 20,
+                    eta: float = 0.0) -> torch.Tensor:
+        B = obs.shape[0]
+        step_size = self.T // T_inf
+        x = torch.randn(B, self.act_dim, device=obs.device)
+
+        timesteps = list(range(self.T - 1, -1, -step_size))[:T_inf]
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        for idx in range(len(timesteps) - 1):
+            t_cur = timesteps[idx]
+            t_next = timesteps[idx + 1]
+
+            t_batch = torch.full((B,), t_cur, device=obs.device, dtype=torch.long)
+            eps = self.noise_pred(x, t_batch, obs, obs_seq, obs_mask)
+            ab_t = self.alpha_bar[t_cur]
+            ab_tn = self.alpha_bar[t_next]
+
+            pred_x0 = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt().clamp(min=1e-8)
+            direction = (x - ab_t.sqrt() * pred_x0) / (1 - ab_t).sqrt().clamp(min=1e-8)
+
+            if eta == 0.0:
+                x = ab_tn.sqrt() * pred_x0 + (1 - ab_tn).sqrt() * direction
+            else:
+                beta_tn = self.betas[t_next]
+                c1 = eta * ((1 - ab_tn / ab_t).clamp(min=0) * (1 - ab_t) / (1 - ab_tn)).sqrt() * beta_tn.sqrt()
+                x = ab_tn.sqrt() * pred_x0 + ((1 - ab_tn) - c1 ** 2).clamp(min=0).sqrt() * direction
+                if t_next > 0:
+                    x = x + c1 * torch.randn_like(x)
+        return x
+

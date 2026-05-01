@@ -30,14 +30,56 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from common import RunningNormalizer, ensure_dir, load_npz_dataset, select_device, split_idx
-from models import BCDiffusion, EMA
+from models import BCDiffusion, BCDiffusionTemporal, EMA
+
+
+class TemporalStepDataset(Dataset):
+    """
+    构建多步输入、单步监督样本：
+    输入: obs_seq (L, D), obs_mask (L,)
+    监督: 当前时刻 obs_t, act_t
+    """
+
+    def __init__(self, obs: np.ndarray, acts: np.ndarray,
+                 starts: np.ndarray, lengths: np.ndarray, seq_len: int):
+        self.samples: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for s, l in zip(starts.tolist(), lengths.tolist()):
+            ep_obs = obs[s:s + l]
+            ep_act = acts[s:s + l]
+            for t in range(l):
+                left = max(0, t - seq_len + 1)
+                seq = ep_obs[left:t + 1]
+                n = seq.shape[0]
+                seq_pad = np.zeros((seq_len, obs.shape[1]), dtype=np.float32)
+                mask = np.zeros((seq_len,), dtype=np.bool_)
+                seq_pad[-n:] = seq
+                mask[-n:] = True
+                self.samples.append((
+                    seq_pad.astype(np.float32),
+                    mask,
+                    ep_obs[t].astype(np.float32),
+                    ep_act[t].astype(np.float32),
+                ))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        seq, mask, obs_t, act_t = self.samples[idx]
+        return (
+            torch.from_numpy(seq),
+            torch.from_numpy(mask),
+            torch.from_numpy(obs_t),
+            torch.from_numpy(act_t),
+        )
 
 
 def main() -> None:
@@ -62,6 +104,18 @@ def main() -> None:
     p.add_argument("--scheduler",       type=str,   default="cosine",
                    choices=["linear", "cosine"],
                    help="Beta schedule：cosine 更平滑（推荐）")
+    p.add_argument("--temporal", action="store_true",
+                   help="启用时序分支（Transformer）进行多步输入单步输出")
+    p.add_argument("--seq-len",         type=int,   default=8,
+                   help="时序输入长度 L（仅 temporal 模式生效）")
+    p.add_argument("--tf-layers",       type=int,   default=2,
+                   help="TransformerEncoder 层数（仅 temporal 模式）")
+    p.add_argument("--tf-heads",        type=int,   default=4,
+                   help="Transformer 多头数（仅 temporal 模式）")
+    p.add_argument("--tf-dropout",      type=float, default=0.1,
+                   help="Transformer dropout（仅 temporal 模式）")
+    p.add_argument("--router-hidden",   type=int,   default=128,
+                   help="路由门控隐藏层宽度（仅 temporal 模式）")
     # ── EMA ────────────────────────────────────────────────────────────────
     p.add_argument("--ema-decay",       type=float, default=0.999,
                    help="EMA decay 系数（0.999 推荐，0=禁用 EMA）")
@@ -80,52 +134,101 @@ def main() -> None:
     data  = load_npz_dataset(args.dataset)
     x_raw = data["obs"].astype(np.float32)
     y_raw = data["acts"].astype(np.float32)
-    train_idx, val_idx = split_idx(len(x_raw), val_ratio=0.1, seed=args.seed)
+    starts = data.get("ep_starts")
+    lengths = data.get("ep_lengths")
 
-    print(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
+    if args.temporal:
+        if starts is None or lengths is None:
+            raise KeyError("temporal mode requires ep_starts and ep_lengths in dataset npz")
+        n_ep = len(starts)
+        ep_train, ep_val = split_idx(n_ep, val_ratio=0.1, seed=args.seed)
+        train_mask = np.zeros(len(x_raw), dtype=bool)
+        for s, l in zip(starts[ep_train].tolist(), lengths[ep_train].tolist()):
+            train_mask[s:s + l] = True
+        print(f"Dataset (temporal): {len(ep_train)} train episodes / {len(ep_val)} val episodes")
+    else:
+        train_idx, val_idx = split_idx(len(x_raw), val_ratio=0.1, seed=args.seed)
+        train_mask = np.zeros(len(x_raw), dtype=bool)
+        train_mask[train_idx] = True
+        print(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
     print(f"obs_dim={x_raw.shape[1]}  act_dim={y_raw.shape[1]}")
 
     # ── 归一化（fit 仅在训练集）───────────────────────────────────────────
     obs_norm = RunningNormalizer(const_thresh=1e-3)
-    obs_norm.fit(x_raw[train_idx])
+    obs_norm.fit(x_raw[train_mask])
     act_norm = RunningNormalizer(const_thresh=0.0)
-    act_norm.fit(y_raw[train_idx])
+    act_norm.fit(y_raw[train_mask])
 
     x = obs_norm.transform(x_raw)
     y = act_norm.transform(y_raw)
 
-    x_train = torch.from_numpy(x[train_idx])
-    y_train = torch.from_numpy(y[train_idx])
-    x_val   = torch.from_numpy(x[val_idx])
-    y_val   = torch.from_numpy(y[val_idx])
+    if args.temporal:
+        train_ds = TemporalStepDataset(x, y, starts[ep_train], lengths[ep_train], args.seq_len)
+        val_ds = TemporalStepDataset(x, y, starts[ep_val], lengths[ep_val], args.seq_len)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+    else:
+        x_train = torch.from_numpy(x[train_idx])
+        y_train = torch.from_numpy(y[train_idx])
+        x_val   = torch.from_numpy(x[val_idx])
+        y_val   = torch.from_numpy(y[val_idx])
 
-    train_loader = DataLoader(
-        TensorDataset(x_train, y_train),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=0,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        TensorDataset(x_val, y_val),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
+        train_loader = DataLoader(
+            TensorDataset(x_train, y_train),
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            TensorDataset(x_val, y_val),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
 
     # ── 模型 ─────────────────────────────────────────────────────────────────
     device = select_device()
-    model  = BCDiffusion(
-        obs_dim  = x.shape[1],
-        act_dim  = y.shape[1],
-        T        = args.T,
-        beta_min = args.beta_min,
-        beta_max = args.beta_max,
-        hidden   = args.hidden,
-        depth    = args.depth,
-        scheduler= args.scheduler,
-    ).to(device)
+    if args.temporal:
+        model = BCDiffusionTemporal(
+            obs_dim=x.shape[1],
+            act_dim=y.shape[1],
+            T=args.T,
+            beta_min=args.beta_min,
+            beta_max=args.beta_max,
+            hidden=args.hidden,
+            depth=args.depth,
+            scheduler=args.scheduler,
+            seq_len=args.seq_len,
+            tf_layers=args.tf_layers,
+            tf_heads=args.tf_heads,
+            tf_dropout=args.tf_dropout,
+            router_hidden=args.router_hidden,
+        ).to(device)
+    else:
+        model = BCDiffusion(
+            obs_dim=x.shape[1],
+            act_dim=y.shape[1],
+            T=args.T,
+            beta_min=args.beta_min,
+            beta_max=args.beta_max,
+            hidden=args.hidden,
+            depth=args.depth,
+            scheduler=args.scheduler,
+        ).to(device)
 
     # ── EMA ──────────────────────────────────────────────────────────────────
     use_ema  = args.ema_decay > 0
@@ -168,10 +271,19 @@ def main() -> None:
         model.train()
         train_loss = 0.0
         n_samples  = 0
-        for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            loss = model(xb, yb, action_noise_std=args.action_noise_std)
+        for batch in train_loader:
+            if args.temporal:
+                seqb, maskb, xb, yb = batch
+                seqb = seqb.to(device)
+                maskb = maskb.to(device)
+                xb = xb.to(device)
+                yb = yb.to(device)
+                loss = model(xb, yb, obs_seq=seqb, obs_mask=maskb, action_noise_std=args.action_noise_std)
+            else:
+                xb, yb = batch
+                xb = xb.to(device)
+                yb = yb.to(device)
+                loss = model(xb, yb, action_noise_std=args.action_noise_std)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -198,10 +310,20 @@ def main() -> None:
         val_loss = 0.0
         v_samples = 0
         with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                val_loss += model(xb, yb).item() * xb.size(0)
+            for batch in val_loader:
+                if args.temporal:
+                    seqb, maskb, xb, yb = batch
+                    seqb = seqb.to(device)
+                    maskb = maskb.to(device)
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+                    batch_loss = model(xb, yb, obs_seq=seqb, obs_mask=maskb).item()
+                else:
+                    xb, yb = batch
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+                    batch_loss = model(xb, yb).item()
+                val_loss += batch_loss * xb.size(0)
                 v_samples += xb.size(0)
         val_loss /= v_samples
 
@@ -228,13 +350,19 @@ def main() -> None:
                     "model":     model.state_dict(),
                     "obs_dim":   x.shape[1],
                     "act_dim":   y.shape[1],
-                    "algo":      "diffusion_v2",
+                    "algo":      "diffusion_temporal_v1" if args.temporal else "diffusion_v2",
                     "T":         args.T,
                     "beta_min":  args.beta_min,
                     "beta_max":  args.beta_max,
                     "hidden":    args.hidden,
                     "depth":     args.depth,
                     "scheduler": args.scheduler,
+                    "temporal":  args.temporal,
+                    "seq_len":   args.seq_len,
+                    "tf_layers": args.tf_layers,
+                    "tf_heads":  args.tf_heads,
+                    "tf_dropout": args.tf_dropout,
+                    "router_hidden": args.router_hidden,
                     "obs_norm":  obs_norm.state_dict(),
                     "act_norm":  act_norm.state_dict(),
                     "ema_decay": args.ema_decay,
@@ -256,13 +384,19 @@ def main() -> None:
                 "model":     model.state_dict(),
                 "obs_dim":   x.shape[1],
                 "act_dim":   y.shape[1],
-                "algo":      "diffusion_v2_swa",
+                "algo":      "diffusion_temporal_v1_swa" if args.temporal else "diffusion_v2_swa",
                 "T":         args.T,
                 "beta_min":  args.beta_min,
                 "beta_max":  args.beta_max,
                 "hidden":    args.hidden,
                 "depth":     args.depth,
                 "scheduler": args.scheduler,
+                "temporal":  args.temporal,
+                "seq_len":   args.seq_len,
+                "tf_layers": args.tf_layers,
+                "tf_heads":  args.tf_heads,
+                "tf_dropout": args.tf_dropout,
+                "router_hidden": args.router_hidden,
                 "obs_norm":  obs_norm.state_dict(),
                 "act_norm":  act_norm.state_dict(),
                 "ema_decay": args.ema_decay,
