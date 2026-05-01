@@ -153,14 +153,16 @@ class SinusoidalPosEmb(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)    # (B, dim)
 
 
-class C4InvariantObsEncoder(nn.Module):
+class RotationInvariantObsEncoder(nn.Module):
     """
-    C4 (0/90/180/270 deg) 离散旋转不变观测编码器。
-    将观测前 pair_dim 维按 (x, y) 成对解释为平面向量，对四个旋转共享同一编码器后做 group average。
+    C_n 离散旋转不变观测编码器（n=4 或 8）。
+    将观测前 pair_dim 维按 (x, y) 成对解释为平面向量，做 group average pooling。
     """
 
-    def __init__(self, obs_dim: int, hidden: int, pair_dim: int | None = None):
+    def __init__(self, obs_dim: int, hidden: int, pair_dim: int | None = None, n_rot: int = 4):
         super().__init__()
+        if n_rot not in (4, 8):
+            raise ValueError(f"n_rot must be 4 or 8, got {n_rot}")
         max_pair_dim = obs_dim - (obs_dim % 2)
         if pair_dim is None:
             pair_dim = max_pair_dim
@@ -170,6 +172,7 @@ class C4InvariantObsEncoder(nn.Module):
         self.obs_dim = obs_dim
         self.pair_dim = pair_dim
         self.scalar_dim = obs_dim - pair_dim
+        self.n_rot = n_rot
 
         self.encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden),
@@ -180,30 +183,31 @@ class C4InvariantObsEncoder(nn.Module):
             nn.GELU(),
         )
 
-        rot_mats = torch.tensor(
+        angles = torch.linspace(0.0, 2.0 * math.pi, steps=n_rot + 1, dtype=torch.float32)[:-1]
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
+        rot_mats = torch.stack(
             [
-                [[1.0, 0.0], [0.0, 1.0]],    # 0
-                [[0.0, -1.0], [1.0, 0.0]],   # 90
-                [[-1.0, 0.0], [0.0, -1.0]],  # 180
-                [[0.0, 1.0], [-1.0, 0.0]],   # 270
+                torch.stack([cos_a, -sin_a], dim=-1),
+                torch.stack([sin_a, cos_a], dim=-1),
             ],
-            dtype=torch.float32,
+            dim=-2,
         )
         self.register_buffer("rot_mats", rot_mats)
 
     def _group_transform(self, obs: torch.Tensor) -> torch.Tensor:
-        # obs: (B, D) -> (B, 4, D)
+        # obs: (B, D) -> (B, n_rot, D)
         B, D = obs.shape
         if D != self.obs_dim:
-            raise RuntimeError(f"obs dim mismatch in C4InvariantObsEncoder: got {D}, expected {self.obs_dim}")
+            raise RuntimeError(f"obs dim mismatch in RotationInvariantObsEncoder: got {D}, expected {self.obs_dim}")
 
         if self.pair_dim == 0:
-            return obs.unsqueeze(1).expand(B, 4, D)
+            return obs.unsqueeze(1).expand(B, self.n_rot, D)
 
         v = obs[:, :self.pair_dim].reshape(B, self.pair_dim // 2, 2)
-        v_rot = torch.einsum("gij,bkj->bgki", self.rot_mats.to(obs.dtype), v).reshape(B, 4, self.pair_dim)
+        v_rot = torch.einsum("gij,bkj->bgki", self.rot_mats.to(obs.dtype), v).reshape(B, self.n_rot, self.pair_dim)
         if self.scalar_dim > 0:
-            s = obs[:, self.pair_dim:].unsqueeze(1).expand(B, 4, self.scalar_dim)
+            s = obs[:, self.pair_dim:].unsqueeze(1).expand(B, self.n_rot, self.scalar_dim)
             return torch.cat([v_rot, s], dim=-1)
         return v_rot
 
@@ -213,6 +217,191 @@ class C4InvariantObsEncoder(nn.Module):
         B, G, D = xg.shape
         h = self.encoder(xg.reshape(B * G, D)).reshape(B, G, -1)
         return h.mean(dim=1)
+
+
+class SE2SteerableObsEncoder(nn.Module):
+    """
+    连续 SE(2) 旋转等变的观测编码器（输出旋转不变 embedding）。
+    - 前 pair_dim 维按 (x, y) 成对解释为 2D 向量通道
+    - 标量分支只接收旋转不变量（标量 + 向量模长）
+    - 向量分支使用 a*I + b*J 形式的线性映射（J 为 90° 旋转）
+    """
+
+    def __init__(self, obs_dim: int, hidden: int, pair_dim: int | None = None, vec_channels: int | None = None):
+        super().__init__()
+        max_pair_dim = obs_dim - (obs_dim % 2)
+        if pair_dim is None:
+            pair_dim = max_pair_dim
+        pair_dim = max(0, min(int(pair_dim), max_pair_dim))
+        if pair_dim % 2 != 0:
+            pair_dim -= 1
+
+        self.obs_dim = obs_dim
+        self.pair_dim = pair_dim
+        self.scalar_dim = obs_dim - pair_dim
+        self.n_vec = pair_dim // 2
+        self.vec_channels = int(vec_channels or max(16, min(64, hidden // 4)))
+
+        self.fallback = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        if self.n_vec == 0:
+            return
+
+        scalar_in_dim = self.scalar_dim + self.n_vec
+        self.scalar_stem = nn.Sequential(
+            nn.Linear(scalar_in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.scalar_update = nn.Sequential(
+            nn.Linear(hidden + self.vec_channels, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.out_proj = nn.Sequential(
+            nn.Linear(hidden + self.vec_channels, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.vec_gate = nn.Sequential(
+            nn.Linear(hidden, self.vec_channels),
+            nn.Sigmoid(),
+        )
+
+        # 等变线性映射: y = A*v + B*J(v)
+        self.in_a = nn.Parameter(torch.randn(self.n_vec, self.vec_channels) * 0.02)
+        self.in_b = nn.Parameter(torch.randn(self.n_vec, self.vec_channels) * 0.02)
+        self.mix_a = nn.Parameter(torch.randn(self.vec_channels, self.vec_channels) * 0.02)
+        self.mix_b = nn.Parameter(torch.randn(self.vec_channels, self.vec_channels) * 0.02)
+
+    @staticmethod
+    def _rot90(v: torch.Tensor) -> torch.Tensor:
+        # v: (..., 2)
+        return torch.stack([-v[..., 1], v[..., 0]], dim=-1)
+
+    @staticmethod
+    def _vec_norm(v: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt((v * v).sum(dim=-1).clamp(min=1e-12))
+
+    @staticmethod
+    def _equivariant_mix(v: torch.Tensor, w_a: torch.Tensor, w_b: torch.Tensor) -> torch.Tensor:
+        # v: (B, Cin, 2), w_*: (Cin, Cout) -> (B, Cout, 2)
+        vj = SE2SteerableObsEncoder._rot90(v)
+        return torch.einsum("bic,io->boc", v, w_a) + torch.einsum("bic,io->boc", vj, w_b)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        B, D = obs.shape
+        if D != self.obs_dim:
+            raise RuntimeError(f"obs dim mismatch in SE2SteerableObsEncoder: got {D}, expected {self.obs_dim}")
+        if self.n_vec == 0:
+            return self.fallback(obs)
+
+        v = obs[:, :self.pair_dim].reshape(B, self.n_vec, 2)
+        s = obs[:, self.pair_dim:]
+        v0_norm = self._vec_norm(v)
+
+        if self.scalar_dim > 0:
+            h = self.scalar_stem(torch.cat([s, v0_norm], dim=-1))
+        else:
+            h = self.scalar_stem(v0_norm)
+
+        v_h = self._equivariant_mix(v, self.in_a, self.in_b)
+        for _ in range(2):
+            gate = self.vec_gate(h).unsqueeze(-1)
+            v_h = v_h * gate + self._equivariant_mix(v_h, self.mix_a, self.mix_b)
+            v_norm = self._vec_norm(v_h)
+            h = h + self.scalar_update(torch.cat([h, v_norm], dim=-1))
+
+        v_norm = self._vec_norm(v_h)
+        return self.out_proj(torch.cat([h, v_norm], dim=-1))
+
+
+class HarmonicObsEncoder(nn.Module):
+    """
+    复数谐波 Fourier 特征编码器（E(2)/SE(2) 风格）。
+    使用 z = x + i y 的谐波矩（m=1..M）幅值作为旋转不变特征。
+    """
+
+    def __init__(self, obs_dim: int, hidden: int, pair_dim: int | None = None, max_order: int = 4):
+        super().__init__()
+        max_pair_dim = obs_dim - (obs_dim % 2)
+        if pair_dim is None:
+            pair_dim = max_pair_dim
+        pair_dim = max(0, min(int(pair_dim), max_pair_dim))
+        if pair_dim % 2 != 0:
+            pair_dim -= 1
+
+        self.obs_dim = obs_dim
+        self.pair_dim = pair_dim
+        self.scalar_dim = obs_dim - pair_dim
+        self.n_vec = pair_dim // 2
+        self.max_order = max(1, int(max_order))
+
+        self.fallback = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        if self.n_vec == 0:
+            return
+
+        feat_dim = self.scalar_dim + self.n_vec + self.max_order
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.register_buffer("orders", torch.arange(1, self.max_order + 1, dtype=torch.float32))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        B, D = obs.shape
+        if D != self.obs_dim:
+            raise RuntimeError(f"obs dim mismatch in HarmonicObsEncoder: got {D}, expected {self.obs_dim}")
+        if self.n_vec == 0:
+            return self.fallback(obs)
+
+        v = obs[:, :self.pair_dim].reshape(B, self.n_vec, 2)
+        s = obs[:, self.pair_dim:]
+        x = v[..., 0]
+        y = v[..., 1]
+        r = torch.sqrt((x * x + y * y).clamp(min=1e-12))
+        theta = torch.atan2(y, x)
+
+        ords = self.orders.to(obs.dtype).view(1, 1, -1)  # (1,1,M)
+        ang = theta.unsqueeze(-1) * ords                  # (B,N,M)
+        r_pow = r.unsqueeze(-1).pow(ords)                 # (B,N,M)
+
+        # 复数矩 C_m = E[r^m e^{i m theta}]，取 |C_m| 作为旋转不变谱特征
+        c_re = (r_pow * torch.cos(ang)).mean(dim=1)       # (B,M)
+        c_im = (r_pow * torch.sin(ang)).mean(dim=1)       # (B,M)
+        c_mag = torch.sqrt((c_re * c_re + c_im * c_im).clamp(min=1e-12))
+
+        if self.scalar_dim > 0:
+            feat = torch.cat([s, r, c_mag], dim=-1)
+        else:
+            feat = torch.cat([r, c_mag], dim=-1)
+        return self.net(feat)
 
 
 # ── Noise Predictor ────────────────────────────────────────────────────────────
@@ -229,7 +418,8 @@ class NoisePredictor(nn.Module):
     def __init__(self, obs_dim: int, act_dim: int,
                  hidden: int = 384, t_dim: int = 64, depth: int = 6,
                  obs_backbone: str = "mlp",
-                 c4_pair_dim: int | None = None):
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4):
         super().__init__()
         self.t_emb = nn.Sequential(
             SinusoidalPosEmb(t_dim),
@@ -237,8 +427,22 @@ class NoisePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(t_dim * 2, t_dim),
         )
-        if obs_backbone == "c4":
-            self.obs_emb = C4InvariantObsEncoder(obs_dim, hidden, pair_dim=c4_pair_dim)
+        if obs_backbone in ("c4", "c8"):
+            self.obs_emb = RotationInvariantObsEncoder(
+                obs_dim,
+                hidden,
+                pair_dim=rot_pair_dim,
+                n_rot=8 if obs_backbone == "c8" else 4,
+            )
+        elif obs_backbone == "se2":
+            self.obs_emb = SE2SteerableObsEncoder(obs_dim, hidden, pair_dim=rot_pair_dim)
+        elif obs_backbone == "harmonic":
+            self.obs_emb = HarmonicObsEncoder(
+                obs_dim,
+                hidden,
+                pair_dim=rot_pair_dim,
+                max_order=harmonic_order,
+            )
         else:
             self.obs_emb = nn.Sequential(
                 nn.Linear(obs_dim, hidden),
@@ -307,7 +511,8 @@ class BCDiffusion(nn.Module):
                  hidden: int = 384, depth: int = 6,
                  scheduler: str = "cosine",
                  obs_backbone: str = "mlp",
-                 c4_pair_dim: int | None = None):
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4):
         super().__init__()
         self.T        = T
         self.act_dim  = act_dim
@@ -322,7 +527,8 @@ class BCDiffusion(nn.Module):
             hidden=hidden,
             depth=depth,
             obs_backbone=obs_backbone,
-            c4_pair_dim=c4_pair_dim,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
         )
 
     def _build_schedule(self, beta_min: float, beta_max: float):
@@ -487,7 +693,8 @@ class TemporalFusionNoisePredictor(nn.Module):
                  tf_dropout: float = 0.1,
                  router_hidden: int = 128,
                  obs_backbone: str = "mlp",
-                 c4_pair_dim: int | None = None):
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4):
         super().__init__()
         self.seq_len = seq_len
         self.obs_backbone = obs_backbone
@@ -498,7 +705,8 @@ class TemporalFusionNoisePredictor(nn.Module):
             t_dim=t_dim,
             depth=depth,
             obs_backbone=obs_backbone,
-            c4_pair_dim=c4_pair_dim,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
         )
 
         self.t_emb = SinusoidalPosEmb(t_dim)
@@ -507,8 +715,23 @@ class TemporalFusionNoisePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, hidden),
         )
-        if obs_backbone == "c4":
-            self.obs_encoder = C4InvariantObsEncoder(obs_dim, hidden, pair_dim=c4_pair_dim)
+        if obs_backbone in ("c4", "c8", "se2", "harmonic"):
+            if obs_backbone in ("c4", "c8"):
+                self.obs_encoder = RotationInvariantObsEncoder(
+                    obs_dim,
+                    hidden,
+                    pair_dim=rot_pair_dim,
+                    n_rot=8 if obs_backbone == "c8" else 4,
+                )
+            elif obs_backbone == "se2":
+                self.obs_encoder = SE2SteerableObsEncoder(obs_dim, hidden, pair_dim=rot_pair_dim)
+            else:
+                self.obs_encoder = HarmonicObsEncoder(
+                    obs_dim,
+                    hidden,
+                    pair_dim=rot_pair_dim,
+                    max_order=harmonic_order,
+                )
             self.cur_obs_proj = nn.Identity()
             self.seq_in = nn.Identity()
         else:
@@ -618,7 +841,8 @@ class BCDiffusionTemporal(BCDiffusion):
                  tf_dropout: float = 0.1,
                  router_hidden: int = 128,
                  obs_backbone: str = "mlp",
-                 c4_pair_dim: int | None = None):
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4):
         super().__init__(
             obs_dim=obs_dim,
             act_dim=act_dim,
@@ -629,7 +853,8 @@ class BCDiffusionTemporal(BCDiffusion):
             depth=depth,
             scheduler=scheduler,
             obs_backbone=obs_backbone,
-            c4_pair_dim=c4_pair_dim,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
         )
         self.seq_len = seq_len
         self.noise_pred = TemporalFusionNoisePredictor(
@@ -643,7 +868,8 @@ class BCDiffusionTemporal(BCDiffusion):
             tf_dropout=tf_dropout,
             router_hidden=router_hidden,
             obs_backbone=obs_backbone,
-            c4_pair_dim=c4_pair_dim,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
         )
 
     def forward(self,

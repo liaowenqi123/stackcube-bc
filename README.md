@@ -86,27 +86,102 @@ python src\train_bcrnn.py `
 
 ---
 
-## 训练最新 Transformer+Diffusion（推荐）
+## Diffusion 路线总览（v1 → v3 → 时序 → 等变骨干）
 
-本仓库里“Transformer + Diffusion”对应 `train_bcdiffusion.py --temporal`（`BCDiffusionTemporal`）。
+下面按你们当前代码里的真实实验脉络整理，方便直接复现实验与对比。
 
-### 一键训练 + 评估（输出 3 个 GIF）
+| 版本 | 核心改动 | 训练输出目录 |
+|---|---|---|
+| diffusion v1 | 基础 DDPM/DDIM diffusion policy | `outputs/diffusion` |
+| diffusion v2 | 容量增大 + cosine + EMA + action noise + SWA | `outputs/diffusion_v2` |
+| diffusion v3 | v2 进一步调参与训练策略迭代 | `outputs/diffusion_v3` |
+| temporal diffusion | `--temporal` + Transformer 时序分支 | `outputs/diffusion_temporal_*` |
+| v1 + C4/C8 | 非时序 v1 + 离散旋转不变骨干 | `outputs/diffusion_v1_c8`（默认脚本） |
+| v1 + SE2 | 非时序 v1 + 连续参数化 SE(2) steerable 骨干 | `outputs/diffusion_v1_se2_e200` |
+| v1 + harmonic | 非时序 v1 + 复数谐波 Fourier 特征骨干 | `outputs/diffusion_v1_harmonic_e200` |
+
+### 当前一键脚本（默认）
 
 ```sh
 sh ./run_transformer_diffusion.sh
 ```
 
-默认会：
-- 训练到 `outputs/diffusion_temporal_latest`
-- 评估到 `outputs/eval_diffusion_temporal_latest`
-- 生成 `rollout_ep000.gif`、`rollout_ep001.gif`、`rollout_ep002.gif`
-- 默认启用 `--obs-backbone c4`（离散旋转不变观测骨干）
+当前脚本默认是：**非时序 diffusion(v1 路线) + `obs-backbone=c8`**，并导出 3 个 GIF。  
+默认目录：
+- 训练：`outputs/diffusion_v1_c8`
+- 评估：`outputs/eval_diffusion_v1_c8`
 
-可通过环境变量覆盖参数（示例）：
+可覆盖（不改变参数语义）：
 
 ```sh
-EPOCHS=300 EPISODES=20 T_INF=20 SAMPLER=ddim sh ./run_transformer_diffusion.sh
+EPOCHS=300 EPISODES=20 T_INF=20 SAMPLER=ddim OBS_BACKBONE=c8 ROT_PAIR_DIM=-1 sh ./run_transformer_diffusion.sh
 ```
+
+### 训练入口（统一）
+
+`src/train_bcdiffusion.py` 支持统一骨干开关：
+
+- `--obs-backbone mlp`：普通 MLP 条件编码
+- `--obs-backbone c4`：C4 离散旋转不变
+- `--obs-backbone c8`：C8 离散旋转不变
+- `--obs-backbone se2`：连续参数化 SE(2) steerable
+- `--obs-backbone harmonic`：复数谐波 Fourier 特征
+
+相关参数：
+- `--rot-pair-dim`：前缀 `(x,y)` 成对向量维度（`-1` 自动）
+- `--harmonic-order`：仅 harmonic 生效，谐波最高阶数 `M`
+
+### 常用训练命令
+
+```powershell
+# v1 baseline
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion --epochs 300 --batch-size 512 --lr 1e-4
+
+# v2 / v3 风格（非时序，强配置）
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_v2 --epochs 500 --batch-size 512 --lr 1e-4 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 450
+
+# temporal diffusion（Transformer）
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_temporal_run1 --epochs 500 --batch-size 512 --lr 1e-4 --temporal --seq-len 8 --tf-layers 2 --tf-heads 4 --tf-dropout 0.1 --router-hidden 128 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 450
+
+# v1 + C8（当前默认推荐）
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_v1_c8 --epochs 500 --batch-size 512 --lr 1e-4 --obs-backbone c8 --rot-pair-dim -1 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 450
+
+# v1 + SE2（连续等变骨干）
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_v1_se2_e200 --epochs 200 --batch-size 512 --lr 1e-4 --obs-backbone se2 --rot-pair-dim -1 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 180
+
+# v1 + harmonic（复数谐波骨干）
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_v1_harmonic_e200 --epochs 200 --batch-size 512 --lr 1e-4 --obs-backbone harmonic --rot-pair-dim -1 --harmonic-order 4 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 180
+```
+
+### 评估命令模板（所有 diffusion 版本通用）
+
+```powershell
+python src\eval_policy.py `
+  --algo diffusion `
+  --ckpt .\outputs\<your_model_dir>\swa.pt `
+  --episodes 100 `
+  --output-dir .\outputs\<your_eval_dir> `
+  --max-steps 400 `
+  --sampler ddim `
+  --T-inf 20 `
+  --eta 0.0 `
+  --save-gif `
+  --gif-episodes 3
+```
+
+> 如果目录里没有 `swa.pt`，把 `--ckpt` 改成 `best.pt`。
+
+### 当前已跑训练的 best_val_loss（便于横向看收敛）
+
+| 训练目录 | best_val_loss |
+|---|---:|
+| `outputs/diffusion` | 0.0816 |
+| `outputs/diffusion_v2` | 0.0409 |
+| `outputs/diffusion_v3` | 0.0427 |
+| `outputs/diffusion_temporal_latest` | 0.0772 |
+| `outputs/diffusion_v1_c8` | 0.0507 |
+| `outputs/diffusion_v1_se2_e200` | 0.0534 |
+| `outputs/diffusion_v1_harmonic_e200` | 0.0869 |
 
 ---
 
