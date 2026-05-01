@@ -86,6 +86,29 @@ python src\train_bcrnn.py `
 
 ---
 
+## 训练最新 Transformer+Diffusion（推荐）
+
+本仓库里“Transformer + Diffusion”对应 `train_bcdiffusion.py --temporal`（`BCDiffusionTemporal`）。
+
+### 一键训练 + 评估（输出 3 个 GIF）
+
+```sh
+sh ./run_transformer_diffusion.sh
+```
+
+默认会：
+- 训练到 `outputs/diffusion_temporal_latest`
+- 评估到 `outputs/eval_diffusion_temporal_latest`
+- 生成 `rollout_ep000.gif`、`rollout_ep001.gif`、`rollout_ep002.gif`
+
+可通过环境变量覆盖参数（示例）：
+
+```sh
+EPOCHS=300 EPISODES=20 T_INF=20 SAMPLER=ddim sh ./run_transformer_diffusion.sh
+```
+
+---
+
 ## 评估 + Rollout 可视化
 
 ```powershell
