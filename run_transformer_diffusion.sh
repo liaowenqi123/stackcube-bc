@@ -17,6 +17,8 @@ MAX_STEPS="${MAX_STEPS:-400}"
 T_INF="${T_INF:-20}"
 SAMPLER="${SAMPLER:-ddim}"
 ETA="${ETA:-0.0}"
+OBS_BACKBONE="${OBS_BACKBONE:-c4}"
+C4_PAIR_DIM="${C4_PAIR_DIM:--1}"
 
 if [ ! -f "$DATASET" ]; then
   echo "Dataset not found: $DATASET"
@@ -38,6 +40,8 @@ echo "[1/2] Training Transformer+Diffusion (temporal)..."
   --tf-heads 4 \
   --tf-dropout 0.1 \
   --router-hidden 128 \
+  --obs-backbone "$OBS_BACKBONE" \
+  --c4-pair-dim "$C4_PAIR_DIM" \
   --T 100 \
   --hidden 384 \
   --depth 6 \

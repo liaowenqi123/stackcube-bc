@@ -116,6 +116,11 @@ def main() -> None:
                    help="Transformer dropout（仅 temporal 模式）")
     p.add_argument("--router-hidden",   type=int,   default=128,
                    help="路由门控隐藏层宽度（仅 temporal 模式）")
+    p.add_argument("--obs-backbone",    type=str,   default="mlp",
+                   choices=["mlp", "c4"],
+                   help="观测编码骨干：mlp（默认）或 c4（离散旋转不变）")
+    p.add_argument("--c4-pair-dim",     type=int,   default=-1,
+                   help="C4 模式下按(x,y)成对处理的前缀维度，-1 表示自动取最大偶数维")
     # ── EMA ────────────────────────────────────────────────────────────────
     p.add_argument("--ema-decay",       type=float, default=0.999,
                    help="EMA decay 系数（0.999 推荐，0=禁用 EMA）")
@@ -202,6 +207,7 @@ def main() -> None:
 
     # ── 模型 ─────────────────────────────────────────────────────────────────
     device = select_device()
+    c4_pair_dim = None if args.c4_pair_dim < 0 else int(args.c4_pair_dim)
     if args.temporal:
         model = BCDiffusionTemporal(
             obs_dim=x.shape[1],
@@ -217,6 +223,8 @@ def main() -> None:
             tf_heads=args.tf_heads,
             tf_dropout=args.tf_dropout,
             router_hidden=args.router_hidden,
+            obs_backbone=args.obs_backbone,
+            c4_pair_dim=c4_pair_dim,
         ).to(device)
     else:
         model = BCDiffusion(
@@ -228,6 +236,8 @@ def main() -> None:
             hidden=args.hidden,
             depth=args.depth,
             scheduler=args.scheduler,
+            obs_backbone=args.obs_backbone,
+            c4_pair_dim=c4_pair_dim,
         ).to(device)
 
     # ── EMA ──────────────────────────────────────────────────────────────────
@@ -362,11 +372,13 @@ def main() -> None:
                     "tf_layers": args.tf_layers,
                     "tf_heads":  args.tf_heads,
                     "tf_dropout": args.tf_dropout,
-                    "router_hidden": args.router_hidden,
-                    "obs_norm":  obs_norm.state_dict(),
-                    "act_norm":  act_norm.state_dict(),
-                    "ema_decay": args.ema_decay,
-                },
+                     "router_hidden": args.router_hidden,
+                     "obs_backbone": args.obs_backbone,
+                     "c4_pair_dim": c4_pair_dim,
+                     "obs_norm":  obs_norm.state_dict(),
+                     "act_norm":  act_norm.state_dict(),
+                     "ema_decay": args.ema_decay,
+                 },
                 best_path,
             )
             if ema_shadow is not None:
@@ -396,10 +408,12 @@ def main() -> None:
                 "tf_layers": args.tf_layers,
                 "tf_heads":  args.tf_heads,
                 "tf_dropout": args.tf_dropout,
-                "router_hidden": args.router_hidden,
-                "obs_norm":  obs_norm.state_dict(),
-                "act_norm":  act_norm.state_dict(),
-                "ema_decay": args.ema_decay,
+                 "router_hidden": args.router_hidden,
+                 "obs_backbone": args.obs_backbone,
+                 "c4_pair_dim": c4_pair_dim,
+                 "obs_norm":  obs_norm.state_dict(),
+                 "act_norm":  act_norm.state_dict(),
+                 "ema_decay": args.ema_decay,
                 "swa_count": swa_count,
             },
             outdir / "swa.pt",

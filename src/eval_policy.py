@@ -93,9 +93,13 @@ def main() -> None:
         stored_scheduler_raw = ckpt.get("scheduler", "linear")
         stored_depth_raw = ckpt.get("depth", 4)
         stored_hidden_raw = ckpt.get("hidden", 256)
+        stored_obs_backbone_raw = ckpt.get("obs_backbone", "mlp")
+        stored_c4_pair_dim_raw = ckpt.get("c4_pair_dim", None)
         stored_scheduler = str(stored_scheduler_raw) if stored_scheduler_raw is not None else "linear"
         stored_depth = int(stored_depth_raw) if stored_depth_raw is not None else 4
         stored_hidden = int(stored_hidden_raw) if stored_hidden_raw is not None else 256
+        stored_obs_backbone = str(stored_obs_backbone_raw) if stored_obs_backbone_raw is not None else "mlp"
+        stored_c4_pair_dim = int(stored_c4_pair_dim_raw) if stored_c4_pair_dim_raw is not None else None
         is_temporal = bool(ckpt.get("temporal", False)) or str(ckpt.get("algo", "")).startswith("diffusion_temporal")
 
         if is_temporal:
@@ -113,6 +117,8 @@ def main() -> None:
                 tf_heads=int(ckpt.get("tf_heads", 4)),
                 tf_dropout=float(ckpt.get("tf_dropout", 0.1)),
                 router_hidden=int(ckpt.get("router_hidden", 128)),
+                obs_backbone=stored_obs_backbone,
+                c4_pair_dim=stored_c4_pair_dim,
             ).to(device)
         else:
             model = BCDiffusion(
@@ -124,6 +130,8 @@ def main() -> None:
                 hidden=stored_hidden,
                 depth=stored_depth,
                 scheduler=stored_scheduler,
+                obs_backbone=stored_obs_backbone,
+                c4_pair_dim=stored_c4_pair_dim,
             ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

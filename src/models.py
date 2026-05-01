@@ -153,6 +153,68 @@ class SinusoidalPosEmb(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)    # (B, dim)
 
 
+class C4InvariantObsEncoder(nn.Module):
+    """
+    C4 (0/90/180/270 deg) 离散旋转不变观测编码器。
+    将观测前 pair_dim 维按 (x, y) 成对解释为平面向量，对四个旋转共享同一编码器后做 group average。
+    """
+
+    def __init__(self, obs_dim: int, hidden: int, pair_dim: int | None = None):
+        super().__init__()
+        max_pair_dim = obs_dim - (obs_dim % 2)
+        if pair_dim is None:
+            pair_dim = max_pair_dim
+        pair_dim = max(0, min(int(pair_dim), max_pair_dim))
+        if pair_dim % 2 != 0:
+            pair_dim -= 1
+        self.obs_dim = obs_dim
+        self.pair_dim = pair_dim
+        self.scalar_dim = obs_dim - pair_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+
+        rot_mats = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],    # 0
+                [[0.0, -1.0], [1.0, 0.0]],   # 90
+                [[-1.0, 0.0], [0.0, -1.0]],  # 180
+                [[0.0, 1.0], [-1.0, 0.0]],   # 270
+            ],
+            dtype=torch.float32,
+        )
+        self.register_buffer("rot_mats", rot_mats)
+
+    def _group_transform(self, obs: torch.Tensor) -> torch.Tensor:
+        # obs: (B, D) -> (B, 4, D)
+        B, D = obs.shape
+        if D != self.obs_dim:
+            raise RuntimeError(f"obs dim mismatch in C4InvariantObsEncoder: got {D}, expected {self.obs_dim}")
+
+        if self.pair_dim == 0:
+            return obs.unsqueeze(1).expand(B, 4, D)
+
+        v = obs[:, :self.pair_dim].reshape(B, self.pair_dim // 2, 2)
+        v_rot = torch.einsum("gij,bkj->bgki", self.rot_mats.to(obs.dtype), v).reshape(B, 4, self.pair_dim)
+        if self.scalar_dim > 0:
+            s = obs[:, self.pair_dim:].unsqueeze(1).expand(B, 4, self.scalar_dim)
+            return torch.cat([v_rot, s], dim=-1)
+        return v_rot
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # obs: (B, D) -> (B, hidden)
+        xg = self._group_transform(obs)
+        B, G, D = xg.shape
+        h = self.encoder(xg.reshape(B * G, D)).reshape(B, G, -1)
+        return h.mean(dim=1)
+
+
 # ── Noise Predictor ────────────────────────────────────────────────────────────
 
 class NoisePredictor(nn.Module):
@@ -165,7 +227,9 @@ class NoisePredictor(nn.Module):
     """
 
     def __init__(self, obs_dim: int, act_dim: int,
-                 hidden: int = 384, t_dim: int = 64, depth: int = 6):
+                 hidden: int = 384, t_dim: int = 64, depth: int = 6,
+                 obs_backbone: str = "mlp",
+                 c4_pair_dim: int | None = None):
         super().__init__()
         self.t_emb = nn.Sequential(
             SinusoidalPosEmb(t_dim),
@@ -173,14 +237,17 @@ class NoisePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(t_dim * 2, t_dim),
         )
-        self.obs_emb = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-        )
+        if obs_backbone == "c4":
+            self.obs_emb = C4InvariantObsEncoder(obs_dim, hidden, pair_dim=c4_pair_dim)
+        else:
+            self.obs_emb = nn.Sequential(
+                nn.Linear(obs_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+            )
         # 每层：Linear + LayerNorm + FiLM + GELU（含残差）
         self.layers    = nn.ModuleList()
         self.film_mods = nn.ModuleList()
@@ -238,7 +305,9 @@ class BCDiffusion(nn.Module):
                  T: int = 100,
                  beta_min: float = 1e-4, beta_max: float = 2e-2,
                  hidden: int = 384, depth: int = 6,
-                 scheduler: str = "cosine"):
+                 scheduler: str = "cosine",
+                 obs_backbone: str = "mlp",
+                 c4_pair_dim: int | None = None):
         super().__init__()
         self.T        = T
         self.act_dim  = act_dim
@@ -247,7 +316,14 @@ class BCDiffusion(nn.Module):
         # 计算扩散调度参数
         self._build_schedule(beta_min, beta_max)
 
-        self.noise_pred = NoisePredictor(obs_dim, act_dim, hidden=hidden, depth=depth)
+        self.noise_pred = NoisePredictor(
+            obs_dim,
+            act_dim,
+            hidden=hidden,
+            depth=depth,
+            obs_backbone=obs_backbone,
+            c4_pair_dim=c4_pair_dim,
+        )
 
     def _build_schedule(self, beta_min: float, beta_max: float):
         """构建 α、β 调度参数。"""
@@ -409,11 +485,20 @@ class TemporalFusionNoisePredictor(nn.Module):
                  tf_layers: int = 2,
                  tf_heads: int = 4,
                  tf_dropout: float = 0.1,
-                 router_hidden: int = 128):
+                 router_hidden: int = 128,
+                 obs_backbone: str = "mlp",
+                 c4_pair_dim: int | None = None):
         super().__init__()
         self.seq_len = seq_len
+        self.obs_backbone = obs_backbone
         self.base_branch = NoisePredictor(
-            obs_dim=obs_dim, act_dim=act_dim, hidden=hidden, t_dim=t_dim, depth=depth
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden=hidden,
+            t_dim=t_dim,
+            depth=depth,
+            obs_backbone=obs_backbone,
+            c4_pair_dim=c4_pair_dim,
         )
 
         self.t_emb = SinusoidalPosEmb(t_dim)
@@ -422,20 +507,25 @@ class TemporalFusionNoisePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, hidden),
         )
-        self.cur_obs_proj = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-        )
+        if obs_backbone == "c4":
+            self.obs_encoder = C4InvariantObsEncoder(obs_dim, hidden, pair_dim=c4_pair_dim)
+            self.cur_obs_proj = nn.Identity()
+            self.seq_in = nn.Identity()
+        else:
+            self.obs_encoder = None
+            self.cur_obs_proj = nn.Sequential(
+                nn.Linear(obs_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+            )
+            self.seq_in = nn.Sequential(
+                nn.Linear(obs_dim, hidden),
+                nn.LayerNorm(hidden),
+            )
         self.noisy_proj = nn.Sequential(
             nn.Linear(act_dim, hidden),
             nn.LayerNorm(hidden),
             nn.GELU(),
-        )
-
-        self.seq_in = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.LayerNorm(hidden),
         )
         self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, hidden))
         enc_layer = nn.TransformerEncoderLayer(
@@ -474,7 +564,11 @@ class TemporalFusionNoisePredictor(nn.Module):
         if obs_mask is None:
             obs_mask = torch.ones(B, L, device=obs_seq.device, dtype=torch.bool)
 
-        x = self.seq_in(obs_seq) + self.pos_emb[:, :L, :]
+        if self.obs_encoder is not None:
+            x = self.obs_encoder(obs_seq.reshape(B * L, -1)).reshape(B, L, -1)
+        else:
+            x = self.seq_in(obs_seq)
+        x = x + self.pos_emb[:, :L, :]
         x = self.temporal_encoder(x, src_key_padding_mask=~obs_mask)
         x = self.temporal_norm(x)
 
@@ -491,7 +585,10 @@ class TemporalFusionNoisePredictor(nn.Module):
         eps_base = self.base_branch(noisy_act, t, obs)
 
         time_ctx = self.t_proj(self.t_emb(t))
-        obs_ctx = self.cur_obs_proj(obs)
+        if self.obs_encoder is not None:
+            obs_ctx = self.cur_obs_proj(self.obs_encoder(obs))
+        else:
+            obs_ctx = self.cur_obs_proj(obs)
         temp_ctx = self._encode_temporal(obs_seq, obs_mask)
         noisy_ctx = self.noisy_proj(noisy_act)
 
@@ -519,7 +616,9 @@ class BCDiffusionTemporal(BCDiffusion):
                  tf_layers: int = 2,
                  tf_heads: int = 4,
                  tf_dropout: float = 0.1,
-                 router_hidden: int = 128):
+                 router_hidden: int = 128,
+                 obs_backbone: str = "mlp",
+                 c4_pair_dim: int | None = None):
         super().__init__(
             obs_dim=obs_dim,
             act_dim=act_dim,
@@ -529,6 +628,8 @@ class BCDiffusionTemporal(BCDiffusion):
             hidden=hidden,
             depth=depth,
             scheduler=scheduler,
+            obs_backbone=obs_backbone,
+            c4_pair_dim=c4_pair_dim,
         )
         self.seq_len = seq_len
         self.noise_pred = TemporalFusionNoisePredictor(
@@ -541,6 +642,8 @@ class BCDiffusionTemporal(BCDiffusion):
             tf_heads=tf_heads,
             tf_dropout=tf_dropout,
             router_hidden=router_hidden,
+            obs_backbone=obs_backbone,
+            c4_pair_dim=c4_pair_dim,
         )
 
     def forward(self,

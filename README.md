@@ -100,6 +100,7 @@ sh ./run_transformer_diffusion.sh
 - 训练到 `outputs/diffusion_temporal_latest`
 - 评估到 `outputs/eval_diffusion_temporal_latest`
 - 生成 `rollout_ep000.gif`、`rollout_ep001.gif`、`rollout_ep002.gif`
+- 默认启用 `--obs-backbone c4`（离散旋转不变观测骨干）
 
 可通过环境变量覆盖参数（示例）：
 
