@@ -117,10 +117,12 @@ def main() -> None:
     p.add_argument("--router-hidden",   type=int,   default=128,
                    help="路由门控隐藏层宽度（仅 temporal 模式）")
     p.add_argument("--obs-backbone",    type=str,   default="mlp",
-                   choices=["mlp", "c4"],
-                   help="观测编码骨干：mlp（默认）或 c4（离散旋转不变）")
-    p.add_argument("--c4-pair-dim",     type=int,   default=-1,
-                   help="C4 模式下按(x,y)成对处理的前缀维度，-1 表示自动取最大偶数维")
+                   choices=["mlp", "c4", "c8", "se2", "harmonic"],
+                   help="观测编码骨干：mlp（默认）或 c4/c8/se2/harmonic（旋转等变/不变）")
+    p.add_argument("--c4-pair-dim", "--rot-pair-dim", dest="rot_pair_dim", type=int, default=-1,
+                   help="旋转不变模式下按(x,y)成对处理的前缀维度，-1 表示自动取最大偶数维")
+    p.add_argument("--harmonic-order", type=int, default=4,
+                   help="harmonic 骨干的最高谐波阶数 M")
     # ── EMA ────────────────────────────────────────────────────────────────
     p.add_argument("--ema-decay",       type=float, default=0.999,
                    help="EMA decay 系数（0.999 推荐，0=禁用 EMA）")
@@ -207,7 +209,7 @@ def main() -> None:
 
     # ── 模型 ─────────────────────────────────────────────────────────────────
     device = select_device()
-    c4_pair_dim = None if args.c4_pair_dim < 0 else int(args.c4_pair_dim)
+    rot_pair_dim = None if args.rot_pair_dim < 0 else int(args.rot_pair_dim)
     if args.temporal:
         model = BCDiffusionTemporal(
             obs_dim=x.shape[1],
@@ -224,7 +226,8 @@ def main() -> None:
             tf_dropout=args.tf_dropout,
             router_hidden=args.router_hidden,
             obs_backbone=args.obs_backbone,
-            c4_pair_dim=c4_pair_dim,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=args.harmonic_order,
         ).to(device)
     else:
         model = BCDiffusion(
@@ -237,7 +240,8 @@ def main() -> None:
             depth=args.depth,
             scheduler=args.scheduler,
             obs_backbone=args.obs_backbone,
-            c4_pair_dim=c4_pair_dim,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=args.harmonic_order,
         ).to(device)
 
     # ── EMA ──────────────────────────────────────────────────────────────────
@@ -374,7 +378,9 @@ def main() -> None:
                     "tf_dropout": args.tf_dropout,
                      "router_hidden": args.router_hidden,
                      "obs_backbone": args.obs_backbone,
-                     "c4_pair_dim": c4_pair_dim,
+                     "rot_pair_dim": rot_pair_dim,
+                     "c4_pair_dim": rot_pair_dim,
+                     "harmonic_order": int(args.harmonic_order),
                      "obs_norm":  obs_norm.state_dict(),
                      "act_norm":  act_norm.state_dict(),
                      "ema_decay": args.ema_decay,
@@ -410,7 +416,9 @@ def main() -> None:
                 "tf_dropout": args.tf_dropout,
                  "router_hidden": args.router_hidden,
                  "obs_backbone": args.obs_backbone,
-                 "c4_pair_dim": c4_pair_dim,
+                 "rot_pair_dim": rot_pair_dim,
+                 "c4_pair_dim": rot_pair_dim,
+                 "harmonic_order": int(args.harmonic_order),
                  "obs_norm":  obs_norm.state_dict(),
                  "act_norm":  act_norm.state_dict(),
                  "ema_decay": args.ema_decay,

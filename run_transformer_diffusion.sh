@@ -1,12 +1,12 @@
 #!/usr/bin/env sh
 set -eu
 
-# One-click: train latest Transformer+Diffusion policy and run eval with 3 GIFs.
+# One-click: train basic Diffusion(v1 path) + C8 invariant backbone and run eval with 3 GIFs.
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASET="${DATASET:-./data/processed/stackcube_rl_state.npz}"
-OUTDIR="${OUTDIR:-./outputs/diffusion_temporal_latest}"
-EVAL_DIR="${EVAL_DIR:-./outputs/eval_diffusion_temporal_latest}"
+OUTDIR="${OUTDIR:-./outputs/diffusion_v1_c8}"
+EVAL_DIR="${EVAL_DIR:-./outputs/eval_diffusion_v1_c8}"
 
 EPOCHS="${EPOCHS:-500}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
@@ -17,8 +17,8 @@ MAX_STEPS="${MAX_STEPS:-400}"
 T_INF="${T_INF:-20}"
 SAMPLER="${SAMPLER:-ddim}"
 ETA="${ETA:-0.0}"
-OBS_BACKBONE="${OBS_BACKBONE:-c4}"
-C4_PAIR_DIM="${C4_PAIR_DIM:--1}"
+OBS_BACKBONE="${OBS_BACKBONE:-c8}"
+ROT_PAIR_DIM="${ROT_PAIR_DIM:--1}"
 
 if [ ! -f "$DATASET" ]; then
   echo "Dataset not found: $DATASET"
@@ -27,21 +27,15 @@ if [ ! -f "$DATASET" ]; then
   exit 1
 fi
 
-echo "[1/2] Training Transformer+Diffusion (temporal)..."
+echo "[1/2] Training Diffusion (non-temporal) with rotational invariant backbone..."
 "$PYTHON_BIN" src/train_bcdiffusion.py \
   --dataset "$DATASET" \
   --outdir "$OUTDIR" \
   --epochs "$EPOCHS" \
   --batch-size "$BATCH_SIZE" \
   --lr "$LR" \
-  --temporal \
-  --seq-len 8 \
-  --tf-layers 2 \
-  --tf-heads 4 \
-  --tf-dropout 0.1 \
-  --router-hidden 128 \
   --obs-backbone "$OBS_BACKBONE" \
-  --c4-pair-dim "$C4_PAIR_DIM" \
+  --rot-pair-dim "$ROT_PAIR_DIM" \
   --T 100 \
   --hidden 384 \
   --depth 6 \
