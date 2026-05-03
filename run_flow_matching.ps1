@@ -1,0 +1,1 @@
+python src\train_bcflowmatching.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\flow_matching_v1 --epochs 200 --batch-size 512 --lr 1e-4 --hidden 256 --depth 4 --obs-backbone mlp --T 100 --solver-steps 20 --solver-method euler --ema-decay 0.999 --cfg-strength 1.0 --residual-film

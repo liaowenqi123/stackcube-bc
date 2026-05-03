@@ -230,34 +230,56 @@ python src\eval_policy.py `
 - `returns_hist.png` — 回报分布图
 - `rollout_ep000.gif` 等 — 可直接展示的 rollout 动图
 
-## 当前实验结果
+## 实验结果总览
 
-| 模型 | Episodes | Success Rate | 备注 |
-|------|:--------:|:-----------:|------|
-| BC (MLP) | 100 | **76%** | 基线 |
-| Diffusion v1 (harmonic) | 40 | **68%** | 等变骨干 |
-| Diffusion v3 | 50 | **84%** | best: 500ep, hidden=384, depth=6, cosine, SWA |
-| Diffusion v3 + SE2 Aug | 50 | **68%** | 48+10维旋转不变特征 |
-| Diffusion v3 + Naive Aug | 50 | **76%** | 48+12维相对向量 |
-| Entity-Aware Diffusion v1 | - | **待评估** | Cross-Attention双分支 |
+### 全部方案对比
 
-### Entity-Aware Diffusion Policy（新）
+| # | 方案 | 核心思路 | 输入维度 | SR | Eps | 备注 |
+|:--|------|---------|:---:|:---:|:---:|------|
+| 1 | BC (MLP) | 基础MLP行为克隆 | 48 | **76%** | 100 | 基线 |
+| 2 | Diffusion v1 | 基础DDPM+DDIM扩散策略 | 48 | **~70%** | 10 | |
+| 3 | Diffusion v3 | 增大容量(hidden=384,depth=6)+cosine scheduler+EMA+SWA | 48 | **84%** | 50 | 🏆最佳DL |
+| 4 | Diffusion v3 + Naive Aug | v3基础上拼接12维相对向量(cubeA-ee, cubeB-cubeA, goal-cubeB, ee_pos) | 48→60 | **76%** | 50 | 持平基线 |
+| 5 | Diffusion v3 + SE2 Aug | v3基础上拼接10维SE(2)不变特征(6个成对x-y距离+4个z高度) | 48→58 | **68%** | 50 | 额外特征干扰 |
+| 6 | Diffusion Aug v2 | 另一种相对向量拼接方案 | 48→60 | **54%** | 50 | |
+| 7 | Diffusion v1 + C8骨干 | C8离散旋转不变编码器：将前pair_dim维按(x,y)成对做group average pooling | 48 | **73%** | 100 | |
+| 8 | Diffusion v1 + SE2骨干 | SE(2) steerable编码器：向量分支用aI+bJ线性映射，标量分支取模长 | 48 | **58%** | 100 | |
+| 9 | Diffusion v1 + Harmonic骨干 | 复数谐波Fourier编码器：z=x+iy的m阶谐波矩(Re/Im/\|.\|) | 48 | **6%** | 100 | 数值崩溃 |
+| 10 | Diffusion v1 + Harmonic Fix | Harmonic修复版：添加pred_x0 clamp防止NaN | 48 | **64%** | 100 | |
+| 11 | SE(2) Diffusion v3 | 独立SE(2)等变模型(成对距离+高度+FK末端)，v3训练配置 | 60 | **68%** | 50 | |
+| 12 | Temporal Diffusion | 双分支：单步FiLM-MLP + Transformer时序编码器(obs序列)，路由门控融合 | 48 | **62%** | 100 | |
+| 13 | CQE Diffusion | 双分支编码：绝对分支(全量obs)+相对分支(几何关系)，门控融合+可学习群作用器T_φ软等变约束 | 48 | **74%** | 100 | |
+| 14 | Entity-Aware v1 | 双分支：标准NoisePredictor + TransformerEncoder(2层4头)实体Cross-Attention，门控融合 | 48 | **56%** | 50 | 5.8M参数过拟合 |
+| 15 | Entity-Aware v2 | 轻量版：单层MultiheadAttention(64维2头)替代Transformer | 48 | **32%** | 50 | |
+| 16 | Entity-Aware Small | 更轻量版(3.3M参数) | 48 | **58%** | 50 | |
+| 17 | Flow Matching | 速度场预测替代噪声预测，条件流匹配+OT路径+ODE推理 | 48 | **0%** | 100 | 完全失败 |
+| 18 | **PID Controller** | 6DOF IK(数值Jacobian)+姿态控制(TCP垂直向下)+分阶段抓取 | - | **82%** | - | 经典控制 |
 
-**核心创新**：在标准扩散噪声预测器基础上增加实体关系Cross-Attention分支。
+### 关键发现
 
-- **分支1**：标准NoisePredictor（同v3）
-- **分支2**：提取(ee, cubeA, cubeB, goal)四个实体→Transformer Encoder→Cross-Attention
-- **融合**：门控自适应融合
+1. **最佳DL模型：Diffusion v3 = 84%**（hidden=384, depth=6, cosine scheduler, EMA, SWA）
+2. **经典PID控制 = 82%**，接近最佳DL模型，说明StackCube任务结构性强，经典方法即可高效求解
+3. **所有等变/不变性尝试均未超过v3**——机械臂本身不是旋转对称的，等变约束反而限制了模型表达能力
+4. **输入维度增强(48→60)无收益**：无论拼接相对向量(12维)还是SE(2)不变特征(10维)，均不如原始48维
+5. **Entity-Aware过参数化导致严重过拟合**：5.8M参数→56%，轻量化后仍不如基线
+6. **Flow Matching完全失败**：连续归一化流在此任务上训练不稳定
 
-```powershell
-# 训练
-python run_train_entity.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_entity_v1 --epochs 500 --batch-size 512 --lr 1e-4 --hidden 384 --depth 6 --scheduler cosine --swa-start 450
+### 观测空间布局（48维）
 
-# 评估
-python src\eval_entity.py --ckpt .\outputs\diffusion_entity_v1\best.pt --episodes 50 --output-dir .\outputs\eval_entity --T-inf 20
-```
-
-**文件**：`src/models_entity.py` / `src/train_entity.py` / `src/eval_entity.py`
+| 维度 | 内容 |
+|------|------|
+| [0:8] | qpos（7关节 + 1夹爪） |
+| [8:16] | qvel |
+| [16:18] | prev_action |
+| [18:21] | TCP位置 (x, y, z) |
+| [21:25] | TCP四元数 |
+| [25:28] | cubeA位置 |
+| [28:32] | cubeA四元数 |
+| [32:35] | cubeB位置 |
+| [35:39] | cubeB四元数 |
+| [39:42] | goal位置 |
+| [42:46] | goal四元数 |
+| [46:48] | extra |
 
 ---
 

@@ -17,60 +17,61 @@ from models import NoisePredictor, SinusoidalPosEmb, BCDiffusion
 
 
 class EntityEncoder(nn.Module):
-    """将观测中的实体提取为token，用Cross-Attention建模关系"""
+    """轻量实体编码器：比v1缩小5倍，避免过拟合"""
     
-    def __init__(self, entity_dim=7, n_entities=4, hidden=384, n_heads=4, tf_layers=2):
+    def __init__(self, entity_dim=7, n_entities=4, hidden=384, ent_hidden=64, n_heads=2):
         super().__init__()
         self.n_entities = n_entities
         
-        # 每个实体投影到hidden维
+        # 每个实体投影到小维度
         self.entity_proj = nn.Sequential(
-            nn.Linear(entity_dim, hidden),
-            nn.LayerNorm(hidden),
+            nn.Linear(entity_dim, ent_hidden),
+            nn.LayerNorm(ent_hidden),
             nn.GELU(),
+            nn.Dropout(0.2),
         )
         
-        # 位置编码（区分4个实体的身份）
-        self.pos_embed = nn.Parameter(torch.randn(1, n_entities, hidden) * 0.02)
+        # 位置编码
+        self.pos_embed = nn.Parameter(torch.randn(1, n_entities, ent_hidden) * 0.02)
         
-        # Transformer Encoder (Cross-Attention)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden, nhead=n_heads, dim_feedforward=hidden*2,
-            dropout=0.1, activation='gelu', batch_first=True,
-            norm_first=True,
+        # 单层MultiheadAttention（轻量cross-attention，不用完整Transformer）
+        self.cross_attn = nn.MultiheadAttention(
+            ent_hidden, num_heads=n_heads, dropout=0.2,
+            batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=tf_layers)
+        self.attn_norm = nn.LayerNorm(ent_hidden)
+        self.attn_drop = nn.Dropout(0.2)
         
-        # 输出投影
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(hidden),
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(ent_hidden, ent_hidden * 2),
             nn.GELU(),
-            nn.Linear(hidden, hidden),
+            nn.Dropout(0.2),
+            nn.Linear(ent_hidden * 2, ent_hidden),
         )
+        self.ffn_norm = nn.LayerNorm(ent_hidden)
+        
+        # 输出投影到main分支的hidden维
+        self.out_proj = nn.Linear(ent_hidden, hidden)
     
     def forward(self, obs):
-        """
-        obs: (B, 48) 原始观测
-        returns: (B, hidden) 实体关系特征
-        """
-        # 提取4个实体 (每个7维：位置3+四元数4)
         entities = torch.stack([
-            obs[:, 18:25],  # ee
-            obs[:, 25:32],  # cubeA
-            obs[:, 32:39],  # cubeB
-            obs[:, 39:46],  # goal
+            obs[:, 18:25], obs[:, 25:32],
+            obs[:, 32:39], obs[:, 39:46],
         ], dim=1)  # (B, 4, 7)
         
-        # 投影+位置编码
-        tok = self.entity_proj(entities)  # (B, 4, hidden)
-        tok = tok + self.pos_embed
+        tok = self.entity_proj(entities) + self.pos_embed  # (B, 4, 64)
         
-        # Cross-Attention: 所有实体之间互相交互
-        tok = self.transformer(tok)  # (B, 4, hidden)
+        # Self-attention（所有实体交互）
+        attn_out, _ = self.cross_attn(tok, tok, tok)
+        tok = self.attn_norm(tok + self.attn_drop(attn_out))
         
-        # 全局池化 → 1个实体关系向量
-        pooled = tok.mean(dim=1)  # (B, hidden)
-        return self.out_proj(pooled)
+        # FFN
+        tok = self.ffn_norm(tok + self.ffn(tok))
+        
+        # 池化 → 投影到主分支维度
+        pooled = tok.mean(dim=1)  # (B, 64)
+        return self.out_proj(pooled)  # (B, 384)
 
 
 class NoisePredictorEntity(nn.Module):
@@ -105,7 +106,7 @@ class NoisePredictorEntity(nn.Module):
         # ── 分支2: 实体关系编码（Cross-Attention） ──
         self.entity_encoder = EntityEncoder(
             entity_dim=7, n_entities=4,
-            hidden=hidden, n_heads=4, tf_layers=2,
+            hidden=hidden, ent_hidden=64, n_heads=2,
         )
         
         # 融合门控: 自适应融合两个分支

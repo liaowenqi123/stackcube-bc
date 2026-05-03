@@ -13,6 +13,16 @@ __pycache__/
 # WorkBuddy AI working memory
 .workbuddy/
 
+# Outputs (models, gifs, eval results)
+outputs/
+
+# Data files (large binary)
+data/processed/*.npz
+
+# Temp/log files
+*.txt
+!requirements.txt
+
 # OS
 .DS_Store/
 Thumbs.db
