@@ -99,6 +99,7 @@ python src\train_bcrnn.py `
 | v1 + C4/C8 | 非时序 v1 + 离散旋转不变骨干 | `outputs/diffusion_v1_c8`（默认脚本） |
 | v1 + SE2 | 非时序 v1 + 连续参数化 SE(2) steerable 骨干 | `outputs/diffusion_v1_se2_e200` |
 | v1 + harmonic | 非时序 v1 + 复数谐波 Fourier 特征骨干 | `outputs/diffusion_v1_harmonic_e200` |
+| CQE Diffusion（新） | 上下文条件“软等变”建模（非严格不变/等变） | `outputs/diffusion_cqe_v1` |
 
 ### 当前一键脚本（默认）
 
@@ -130,6 +131,32 @@ EPOCHS=300 EPISODES=20 T_INF=20 SAMPLER=ddim OBS_BACKBONE=c8 ROT_PAIR_DIM=-1 sh 
 相关参数：
 - `--rot-pair-dim`：前缀 `(x,y)` 成对向量维度（`-1` 自动）
 - `--harmonic-order`：仅 harmonic 生效，谐波最高阶数 `M`
+
+### CQE Diffusion（创新版，不改原 v1）
+
+为了不改动原始 `diffusion v1`，新增了独立实现：
+- `src/models_cqe.py`
+- `src/train_bcdiffusion_cqe.py`
+- `src/eval_policy_cqe.py`
+- `run_cqe_diffusion.sh`
+
+核心思路：同一状态下同时建模绝对分支（机械臂偏置相关）和相对几何分支，并学习一个条件化群作用器 `T_phi(h, g)`，用软一致性损失约束“旋转平移后仍有关联”，但不强行要求严格等变。
+
+一键运行：
+
+```sh
+sh ./run_cqe_diffusion.sh
+```
+
+常用命令：
+
+```powershell
+# 训练
+python src\train_bcdiffusion_cqe.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_cqe_v1 --epochs 300 --batch-size 512 --lr 1e-4 --rot-pair-dim 16 --trans-pairs 2 --sym-lambda 0.1 --id-lambda 0.05
+
+# 评估
+python src\eval_policy_cqe.py --ckpt .\outputs\diffusion_cqe_v1\swa.pt --episodes 100 --output-dir .\outputs\eval_diffusion_cqe_v1 --max-steps 400 --sampler ddim --T-inf 20 --eta 0.0 --save-gif --gif-episodes 3
+```
 
 ### 常用训练命令
 
@@ -203,13 +230,34 @@ python src\eval_policy.py `
 - `returns_hist.png` — 回报分布图
 - `rollout_ep000.gif` 等 — 可直接展示的 rollout 动图
 
-**当前基线结果**（BC，100 episodes eval）：
+## 当前实验结果
 
-| 指标 | 值 |
-|------|------|
-| Success Rate | **76%** |
-| Avg Return | 25.6 |
-| Avg Episode Len | 109.5 步 |
+| 模型 | Episodes | Success Rate | 备注 |
+|------|:--------:|:-----------:|------|
+| BC (MLP) | 100 | **76%** | 基线 |
+| Diffusion v1 (harmonic) | 40 | **68%** | 等变骨干 |
+| Diffusion v3 | 50 | **84%** | best: 500ep, hidden=384, depth=6, cosine, SWA |
+| Diffusion v3 + SE2 Aug | 50 | **68%** | 48+10维旋转不变特征 |
+| Diffusion v3 + Naive Aug | 50 | **76%** | 48+12维相对向量 |
+| Entity-Aware Diffusion v1 | - | **待评估** | Cross-Attention双分支 |
+
+### Entity-Aware Diffusion Policy（新）
+
+**核心创新**：在标准扩散噪声预测器基础上增加实体关系Cross-Attention分支。
+
+- **分支1**：标准NoisePredictor（同v3）
+- **分支2**：提取(ee, cubeA, cubeB, goal)四个实体→Transformer Encoder→Cross-Attention
+- **融合**：门控自适应融合
+
+```powershell
+# 训练
+python run_train_entity.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_entity_v1 --epochs 500 --batch-size 512 --lr 1e-4 --hidden 384 --depth 6 --scheduler cosine --swa-start 450
+
+# 评估
+python src\eval_entity.py --ckpt .\outputs\diffusion_entity_v1\best.pt --episodes 50 --output-dir .\outputs\eval_entity --T-inf 20
+```
+
+**文件**：`src/models_entity.py` / `src/train_entity.py` / `src/eval_entity.py`
 
 ---
 

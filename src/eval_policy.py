@@ -10,10 +10,11 @@ import imageio.v2 as imageio
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from tqdm import tqdm
 import mani_skill.envs  # noqa: F401
 
 from common import RunningNormalizer, select_device
-from models import BCMLP, BCRNN, BCDiffusion, BCDiffusionTemporal
+from models import BCMLP, BCRNN, BCDiffusion, BCDiffusionTemporal, BCDiffusionCRD
 
 
 def flatten_obs(obs) -> np.ndarray:
@@ -90,6 +91,7 @@ def main() -> None:
         # 从 checkpoint 自动检测模型参数
         # v1: hidden=256, depth=4, linear (默认)
         # v2: hidden=384, depth=6, cosine
+        # consistency: consistency正则化版本
         stored_scheduler_raw = ckpt.get("scheduler", "linear")
         stored_depth_raw = ckpt.get("depth", 4)
         stored_hidden_raw = ckpt.get("hidden", 256)
@@ -103,8 +105,26 @@ def main() -> None:
         stored_rot_pair_dim = int(stored_rot_pair_dim_raw) if stored_rot_pair_dim_raw is not None else None
         stored_harmonic_order = int(stored_harmonic_order_raw) if stored_harmonic_order_raw is not None else 4
         is_temporal = bool(ckpt.get("temporal", False)) or str(ckpt.get("algo", "")).startswith("diffusion_temporal")
+        is_consistency = str(ckpt.get("algo", "")).startswith("diffusion_consistency")
 
-        if is_temporal:
+        if is_consistency:
+            model = BCDiffusionCRD(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                T=int(ckpt.get("T", 100)),
+                beta_min=float(ckpt.get("beta_min", 1e-4)),
+                beta_max=float(ckpt.get("beta_max", 2e-2)),
+                hidden=stored_hidden,
+                depth=stored_depth,
+                scheduler=stored_scheduler,
+                obs_backbone=stored_obs_backbone,
+                rot_pair_dim=stored_rot_pair_dim,
+                harmonic_order=stored_harmonic_order,
+                residual_film=bool(ckpt.get("residual_film", True)),
+                consistency_weight=float(ckpt.get("consistency_weight", 0.1)),
+                cfg_strength=float(ckpt.get("cfg_strength", 1.0)),
+            ).to(device)
+        elif is_temporal:
             model = BCDiffusionTemporal(
                 obs_dim=obs_dim,
                 act_dim=act_dim,
@@ -164,16 +184,36 @@ def main() -> None:
     def _preprocess_obs(raw_obs, raw_dim: int) -> np.ndarray:
         """原始 obs → 归一化后的 numpy (D,)"""
         o = flatten_obs(raw_obs)
-        if o.shape[0] != raw_dim:
+        if o.shape[0] < 48:
+            # state_dict模式，展开后的维度可能不全
             o = flatten_state_dict(env.unwrapped.get_state_dict())
+        # 自动补全增强特征
+        if obs_norm is not None and o.shape[0] < obs_norm.mean.shape[0]:
+            n_extra = obs_norm.mean.shape[0] - o.shape[0]
+            if n_extra == 12:
+                # 旧版：相对向量（cubeA-ee, cubeB-cubeA, goal-cubeB, ee_pos）
+                geom = np.concatenate([
+                    o[25:28] - o[18:21], o[32:35] - o[25:28],
+                    o[39:42] - o[32:35], o[18:21],
+                ])
+            elif n_extra == 10:
+                # SE(2)版：成对x-y距离 + 高度（旋转不变）
+                pts = [o[18:21], o[25:28], o[32:35], o[39:42]]
+                geom = np.array([np.linalg.norm(pts[i][:2] - pts[j][:2])
+                                 for i in range(4) for j in range(i+1, 4)] +
+                                [p[2] for p in pts])
+            else:
+                raise RuntimeError(f"Unknown augmentation: {n_extra} extra dims")
+            o = np.concatenate([o, geom])
         if obs_norm is not None:
             o = obs_norm.transform_single(o)
         return o
 
     # 原始 obs 的维度（归一化前）
-    raw_obs_dim = obs_norm.mean.shape[0] if obs_norm is not None else obs_dim
+    raw_obs_dim = 48 if obs_norm is None else min(obs_norm.mean.shape[0], 48)
 
     with torch.no_grad():
+        pbar = tqdm(total=args.episodes, desc='Eval', unit='ep')
         for ep_idx in range(args.episodes):
             obs, _ = env.reset()
             done = False
@@ -252,7 +292,8 @@ def main() -> None:
             ep_lengths.append(t)
             if frames:
                 imageio.mimsave(outdir / f"rollout_ep{ep_idx:03d}.gif", frames, duration=0.04)
-
+            pbar.update(1)
+    pbar.close()
     env.close()
 
     sr = n_succ / args.episodes

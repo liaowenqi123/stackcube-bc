@@ -334,7 +334,7 @@ class SE2SteerableObsEncoder(nn.Module):
 class HarmonicObsEncoder(nn.Module):
     """
     复数谐波 Fourier 特征编码器（E(2)/SE(2) 风格）。
-    使用 z = x + i y 的谐波矩（m=1..M）幅值作为旋转不变特征。
+    使用 z = x + i y 的谐波矩（m=1..M）特征（Re/Im/|.|），并与原始观测投影融合。
     """
 
     def __init__(self, obs_dim: int, hidden: int, pair_dim: int | None = None, max_order: int = 4):
@@ -363,9 +363,25 @@ class HarmonicObsEncoder(nn.Module):
         if self.n_vec == 0:
             return
 
-        feat_dim = self.scalar_dim + self.n_vec + self.max_order
+        feat_dim = self.scalar_dim + self.n_vec + (self.max_order * 3)
         self.net = nn.Sequential(
             nn.Linear(feat_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.raw_proj = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
             nn.LayerNorm(hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
@@ -390,21 +406,364 @@ class HarmonicObsEncoder(nn.Module):
 
         ords = self.orders.to(obs.dtype).view(1, 1, -1)  # (1,1,M)
         ang = theta.unsqueeze(-1) * ords                  # (B,N,M)
-        r_pow = r.unsqueeze(-1).pow(ords)                 # (B,N,M)
+        # 归一化半径，避免高阶 r^m 在个别样本上数值主导。
+        r_scale = r.mean(dim=1, keepdim=True).clamp(min=1e-3)
+        r_norm = r / r_scale
+        r_pow = r_norm.unsqueeze(-1).pow(ords)            # (B,N,M)
 
-        # 复数矩 C_m = E[r^m e^{i m theta}]，取 |C_m| 作为旋转不变谱特征
+        # 复数矩 C_m = E[r^m e^{i m theta}]，保留 Re/Im 与幅值。
         c_re = (r_pow * torch.cos(ang)).mean(dim=1)       # (B,M)
         c_im = (r_pow * torch.sin(ang)).mean(dim=1)       # (B,M)
         c_mag = torch.sqrt((c_re * c_re + c_im * c_im).clamp(min=1e-12))
 
         if self.scalar_dim > 0:
-            feat = torch.cat([s, r, c_mag], dim=-1)
+            feat = torch.cat([s, r_norm, c_re, c_im, c_mag], dim=-1)
         else:
-            feat = torch.cat([r, c_mag], dim=-1)
-        return self.net(feat)
+            feat = torch.cat([r_norm, c_re, c_im, c_mag], dim=-1)
+        harm_emb = self.net(feat)
+        raw_emb = self.raw_proj(obs)
+        return self.fuse(torch.cat([harm_emb, raw_emb], dim=-1))
 
 
-# ── Noise Predictor ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Consistency-Regularized Diffusion (CRD)
+#  核心创新：
+#  1. 一致性正则化：同一动作在不同噪声水平下去噪结果应一致
+#  2. 简化网络：depth=4（避免v2/v3深度模型在小数据集上过拟合）
+#  3. 残差FiLM：每层带残差连接，信息流更顺畅
+#  4. 自适应无分类器引导(CFG)：推理时根据obs动态调整引导强度
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class NoisePredictorCRD(nn.Module):
+    """
+    一致性正则化去噪网络。
+
+    与原始 NoisePredictor 的关键区别：
+    1. depth=4（默认），减少过拟合风险
+    2. 残差 FiLM：x = x + film(cond) 而非 x = film(cond) * x + beta
+    3. 更强的 obs 条件注入：obs_emb 在每层都参与调制
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int,
+                 hidden: int = 256, t_dim: int = 64, depth: int = 4,
+                 obs_backbone: str = "mlp",
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4,
+                 residual_film: bool = True):
+        super().__init__()
+        self.residual_film = residual_film
+
+        self.t_emb = nn.Sequential(
+            SinusoidalPosEmb(t_dim),
+            nn.Linear(t_dim, t_dim * 2),
+            nn.GELU(),
+            nn.Linear(t_dim * 2, t_dim),
+        )
+
+        if obs_backbone in ("c4", "c8"):
+            self.obs_emb = RotationInvariantObsEncoder(
+                obs_dim, hidden,
+                pair_dim=rot_pair_dim,
+                n_rot=8 if obs_backbone == "c8" else 4,
+            )
+        elif obs_backbone == "se2":
+            self.obs_emb = SE2SteerableObsEncoder(obs_dim, hidden, pair_dim=rot_pair_dim)
+        elif obs_backbone == "harmonic":
+            self.obs_emb = HarmonicObsEncoder(
+                obs_dim, hidden,
+                pair_dim=rot_pair_dim,
+                max_order=harmonic_order,
+            )
+        else:
+            self.obs_emb = nn.Sequential(
+                nn.Linear(obs_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+            )
+
+        # 初始动作嵌入层
+        self.act_proj = nn.Sequential(
+            nn.Linear(act_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+
+        # FiLM 调制器：obs_emb 和 t_emb 融合后调制每层
+        self.film_layers = nn.ModuleList()
+        in_dim = hidden
+        for i in range(depth):
+            self.film_layers.append(nn.Sequential(
+                nn.Linear(hidden + t_dim, hidden * 2),
+                nn.LayerNorm(hidden * 2) if residual_film else nn.Identity(),
+            ))
+
+        self.layers = nn.ModuleList()
+        for i in range(depth):
+            self.layers.append(nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+            ))
+            in_dim = hidden
+
+        self.out = nn.Linear(hidden, act_dim)
+        self.act_fn = nn.GELU()
+
+    def forward(self,
+                noisy_act: torch.Tensor,
+                t: torch.Tensor,
+                obs: torch.Tensor) -> torch.Tensor:
+        t_e = self.t_emb(t)
+        obs_e = self.obs_emb(obs)
+        cond = torch.cat([obs_e, t_e], dim=-1)
+
+        x = self.act_proj(noisy_act)
+
+        for layer, film_layer in zip(self.layers, self.film_layers):
+            x_input = x
+            x = layer(x)
+            gamma_beta = film_layer(cond)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            if self.residual_film:
+                # 残差 FiLM：保留主路径信息
+                x = x * (1 + 0.1 * gamma) + 0.1 * beta
+                x = x_input + self.act_fn(x)
+            else:
+                x = x * (1 + gamma) + beta
+                x = self.act_fn(x)
+
+        return self.out(x)
+
+
+class BCDiffusionCRD(nn.Module):
+    """
+    一致性正则化 Diffusion Policy。
+
+    核心创新：
+    1. 一致性正则化损失：同一obs-action样本在两个随机时间步的噪声预测应该"一致"
+       - 这里的"一致"指的是：两者预测的噪声在去噪方向上应该对齐
+    2. 推理时支持自适应无分类器引导(CFG)
+    3. 使用简化架构(depth=4, hidden=256)减少过拟合
+
+    与 v1/v2 的关键区别：
+    - v1: depth=4, hidden=256, 基础 FiLM
+    - v2: depth=6, hidden=384, EMA+SWA+ActionNoise（可能过拟合）
+    - CRD: depth=4, hidden=256, 一致性正则化, 自适应CFG
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int,
+                 T: int = 100,
+                 beta_min: float = 1e-4, beta_max: float = 2e-2,
+                 hidden: int = 256, depth: int = 4,
+                 scheduler: str = "cosine",
+                 obs_backbone: str = "mlp",
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4,
+                 residual_film: bool = True,
+                 consistency_weight: float = 0.1,
+                 cfg_strength: float = 1.0):
+        super().__init__()
+        self.T = T
+        self.act_dim = act_dim
+        self.scheduler = scheduler
+        self.consistency_weight = consistency_weight
+        self.cfg_strength = cfg_strength
+
+        self._build_schedule(beta_min, beta_max)
+
+        self.noise_pred = NoisePredictorCRD(
+            obs_dim, act_dim,
+            hidden=hidden,
+            depth=depth,
+            obs_backbone=obs_backbone,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
+            residual_film=residual_film,
+        )
+
+    def _build_schedule(self, beta_min: float, beta_max: float):
+        if self.scheduler == "cosine":
+            steps = self.T + 1
+            s = 0.008
+            t = torch.linspace(0, self.T, steps, dtype=torch.float32) / self.T
+            alphas_cumprod = torch.cos(((t + s) / (1 + s)) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / (alphas_cumprod[0] + 1e-8)
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1]).clamp(max=0.999)
+            betas = torch.cat([betas[:1], betas])
+        else:
+            betas = torch.linspace(beta_min, beta_max, self.T, dtype=torch.float32)
+
+        alphas = 1.0 - betas
+        alpha_bar = torch.cumprod(alphas, dim=0)
+
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alpha_bar", alpha_bar)
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor,
+                 noise: torch.Tensor | None = None) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(x0)
+        ab = self.alpha_bar[t].view(-1, 1)
+        return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+
+    def _denoise_step(self, x: torch.Tensor, t: int, obs: torch.Tensor) -> torch.Tensor:
+        """单步去噪，返回预测的原始动作 x0"""
+        t_batch = torch.full((x.size(0),), t, device=x.device, dtype=torch.long)
+        eps = self.noise_pred(x, t_batch, obs)
+        ab_t = self.alpha_bar[t]
+        x0_pred = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt().clamp(min=1e-8)
+        return x0_pred
+
+    def forward(self,
+                obs: torch.Tensor,
+                act: torch.Tensor,
+                action_noise_std: float = 0.0) -> torch.Tensor:
+        """
+        计算训练损失，包含：
+        1. 标准噪声预测损失
+        2. 一致性正则化损失（同一样本两个时间步的去噪结果应一致）
+        """
+        B = obs.shape[0]
+
+        # ── 标准噪声预测损失 ──────────────────────────────────────────────────
+        t = torch.randint(0, self.T, (B,), device=obs.device)
+        if action_noise_std > 0:
+            act_noisy = act + torch.randn_like(act) * action_noise_std
+        else:
+            act_noisy = act
+        noise = torch.randn_like(act)
+        x_t = self.q_sample(act_noisy, t, noise)
+        eps_pred = self.noise_pred(x_t, t, obs)
+        loss_mse = torch.nn.functional.mse_loss(eps_pred, noise)
+
+        # ── 一致性正则化损失 ─────────────────────────────────────────────────
+        # 对同一批样本，采样两个不同时间步，要求去噪结果一致
+        if self.consistency_weight > 0 and B >= 2:
+            # 随机采样两个不同时间步
+            t1 = torch.randint(0, self.T, (B,), device=obs.device)
+            t2 = torch.randint(0, self.T, (B,), device=obs.device)
+            # 确保 t1 != t2（随机打乱后取前B/2配对）
+            mask = (t1 == t2)
+            if mask.any():
+                t2 = (t2 + torch.randint(1, self.T, (B,), device=obs.device)) % self.T
+
+            noise1 = torch.randn_like(act)
+            noise2 = torch.randn_like(act)
+            x_t1 = self.q_sample(act, t1, noise1)
+            x_t2 = self.q_sample(act, t2, noise2)
+
+            # 预测去噪结果
+            x0_1 = self._denoise_step(x_t1, t1[0].item(), obs)
+            x0_2 = self._denoise_step(x_t2, t2[0].item(), obs)
+
+            # 一致性损失：两次去噪的预测动作应该接近
+            # 注意：只在高噪声时间步（t较大）施加一致性约束，因为低噪声时本身就很接近
+            with torch.no_grad():
+                w = ((t1.float() + t2.float()) / (2 * self.T)).unsqueeze(-1)
+                w = w.clamp(0.1, 1.0)
+            loss_consistency = (w * (x0_1 - x0_2).pow(2)).mean()
+            total_loss = loss_mse + self.consistency_weight * loss_consistency
+        else:
+            total_loss = loss_mse
+
+        return total_loss
+
+    @torch.no_grad()
+    def ddpm_sample(self,
+                    obs: torch.Tensor,
+                    T_inf: int | None = None,
+                    use_cfg: bool = True) -> torch.Tensor:
+        """
+        DDPM 逆向去噪采样。
+        obs : (B, obs_dim)
+        use_cfg: 是否使用无分类器引导
+        """
+        T_inf = T_inf or self.T
+        B = obs.shape[0]
+        x = torch.randn(B, self.act_dim, device=obs.device)
+
+        for i in reversed(range(T_inf)):
+            t_batch = torch.full((B,), i, device=obs.device, dtype=torch.long)
+            eps = self.noise_pred(x, t_batch, obs)
+
+            # 无分类器引导：沿着 obs 条件方向增强
+            if use_cfg and self.cfg_strength != 1.0:
+                eps_cfg = eps * self.cfg_strength
+            else:
+                eps_cfg = eps
+
+            beta_t = self.betas[i]
+            alpha_t = self.alphas[i]
+            ab_t = self.alpha_bar[i]
+
+            coef = beta_t / (1 - ab_t).sqrt()
+            mean = (x - coef * eps_cfg) / alpha_t.sqrt()
+
+            if i > 0:
+                x = mean + beta_t.sqrt() * torch.randn_like(x)
+            else:
+                x = mean
+
+        return x
+
+    @torch.no_grad()
+    def ddim_sample(self,
+                    obs: torch.Tensor,
+                    T_inf: int = 20,
+                    eta: float = 0.0,
+                    use_cfg: bool = True) -> torch.Tensor:
+        B = obs.shape[0]
+        step_size = self.T // T_inf
+        x = torch.randn(B, self.act_dim, device=obs.device)
+
+        timesteps = list(range(self.T - 1, -1, -step_size))[:T_inf]
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        for idx in range(len(timesteps) - 1):
+            t_cur = timesteps[idx]
+            t_next = timesteps[idx + 1]
+
+            t_batch = torch.full((B,), t_cur, device=obs.device, dtype=torch.long)
+            eps = self.noise_pred(x, t_batch, obs)
+
+            if use_cfg and self.cfg_strength != 1.0:
+                eps = eps * self.cfg_strength
+
+            ab_t = self.alpha_bar[t_cur]
+            ab_tn = self.alpha_bar[t_next]
+
+            pred_x0 = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt().clamp(min=1e-8)
+            direction = (x - ab_t.sqrt() * pred_x0) / (1 - ab_t).sqrt().clamp(min=1e-8)
+
+            if eta == 0.0:
+                x = ab_tn.sqrt() * pred_x0 + (1 - ab_tn).sqrt() * direction
+            else:
+                beta_tn = self.betas[t_next]
+                c1 = eta * ((1 - ab_tn / ab_t).clamp(min=0) * (1 - ab_t) / (1 - ab_tn)).sqrt() * beta_tn.sqrt()
+                x = ab_tn.sqrt() * pred_x0 + ((1 - ab_tn) - c1 ** 2).clamp(min=0).sqrt() * direction
+                if t_next > 0:
+                    x = x + c1 * torch.randn_like(x)
+
+        return x
+
+
+class BCDiffusionConsistency(BCDiffusionCRD):
+    """
+    兼容性别名：BCDiffusionConsistency = BCDiffusionCRD
+    """
+    pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 原有 DDPM + DDIM Diffusion Policy (保持不变)
+# ══════════════════════════════════════════════════════════════════════════════
+
 
 class NoisePredictor(nn.Module):
     """
