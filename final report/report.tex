@@ -30,7 +30,7 @@
 \maketitle
 
 \begin{abstract}
-We present a comprehensive benchmark of imitation learning methods for the StackCube-v1 task in ManiSkill3, comparing behavioral cloning, diffusion policies, equivariant architectures, temporal models, Flow Matching, Deep Koopman operators, and classical PID control. Using 40,697 expert demonstration steps from a PPO-trained policy, we evaluate 18 distinct approaches. Our best diffusion model achieves an 84\% success rate (100-episode eval), closely followed by a PID controller at 82\%. We find that (1) increasing diffusion model capacity (hidden=384, depth=6) with cosine scheduling, EMA, SWA yields the best learned policy; (2) all attempts at rotation-equivariant or invariant architectures underperform; (3) temporal modeling and entity-aware attention provide no benefit; and (4) Flow Matching completely fails on this task. Our results suggest that for strongly-structured robotic stacking tasks, classical control remains competitive, and that the task's inherent structure---a fixed-base serial manipulator---limits the utility of geometric equivariance.
+We present a comprehensive benchmark of imitation learning methods for the StackCube-v1 task in ManiSkill3, comparing behavioral cloning, diffusion policies, equivariant architectures, temporal models, Flow Matching, Deep Koopman operators, and classical PID control. Using 40,697 expert demonstration steps from a PPO-trained policy, we evaluate 18 distinct approaches. Our best diffusion model achieves an 84\% success rate (50-episode eval), closely followed by a PID controller at 82\%. We find that: (1) all rotation-equivariant backbones underperform because the fixed-base robot's joint angles are world-frame-defined---equivariance forces the model to discard orientation information essential for planning; (2) hand-crafted geometric features add noise, not information, since forward kinematics is trivially learned; (3) the near-identical performance of PID (82\%) and diffusion (84\%) reveals a \textbf{data ceiling}: the PPO expert demonstrations lack pushing primitives needed for edge-spawned cubes, capping all methods at 82-84\%. Our results suggest that for structurally-constrained manipulation, improving data diversity---particularly collecting missing behaviors---is more impactful than architectural innovation.
 \end{abstract}
 
 % ═════════════════════════════════════════════════════════════════════════════
@@ -94,7 +94,7 @@ Expert demonstrations are drawn from a pre-trained PPO policy using the \texttt{
 \subsection{Input Augmentation Variants}
 \label{sec:aug}
 
-To test whether explicitly providing geometric features improves learning, we augment the 48-dimensional observation by concatenating:
+To test whether explicitly providing geometric features improves learning, we augment the 48-dimensional observation by concatenating hand-crafted features. However, as we will see, this strategy backfires: forward kinematics is simply matrix multiplication---a neural network learns it trivially. Pre-computing geometric features does not add new information; it adds noise.
 
 \begin{itemize}
     \item \textbf{Naive Aug (No.~4):} 12 relative vectors (cubeA--TCP, cubeB--cubeA, goal--cubeB, TCP position), yielding 60-dimensional input.
@@ -105,7 +105,7 @@ To test whether explicitly providing geometric features improves learning, we au
 \subsection{Rotation-Equivariant Backbones}
 \label{sec:equiv}
 
-We modify the observation encoder component of the NoisePredictor to impose rotation invariance or equivariance. Variants No.~7--10 use the v1 training configuration (hidden=256, depth=4) for fair comparison. Additionally, we implement a stand-alone SE(2) model (No.~11) with a custom architecture:
+We modify the observation encoder component of the NoisePredictor to impose rotation invariance or equivariance. The key insight is: the Franka robot has a fixed base, and its joint angles are defined in the world frame. If you rotate the scene, the joint trajectory does not rotate with it. An equivariant constraint forces the model to ignore absolute orientation, which directly conflicts with the data. Variants No.~7--10 use the v1 training configuration (hidden=256, depth=4) for fair comparison. Additionally, we implement a stand-alone SE(2) model (No.~11) with a custom architecture:
 
 \begin{itemize}
     \item \textbf{C4/C8 (No.~7):} Discrete cyclic group averaging. The first $P$ dimensions are interpreted as $(x,y)$ vector pairs, rotated by $n$ discrete angles in $\{0, 2\pi/n, \ldots\}$, encoded independently, and average-pooled. For C8, $n=8$, pair-dim is automatic.
@@ -216,9 +216,9 @@ Table~\ref{tab:results} presents the full comparison. Diffusion v3 achieves the 
 
 \textbf{Observation 1: Capacity matters.} Diffusion v3 (hidden=384, depth=6, cosine schedule, EMA, SWA) decisively outperforms v1 (70\% vs. 84\%). Each component---larger capacity, better scheduling, weight averaging---contributes incrementally. The SWA checkpoint in particular (80\% at 10 episodes vs. 60\% for best.pt) demonstrates the value of trajectory averaging.
 
-\textbf{Observation 2: Equivariance hurts, not helps.} Every rotation-invariant or equivariant backbone underperforms the vanilla MLP encoder. C8 (73\%) is closest, suggesting discrete invariance does less harm than continuous parameterizations. SE(2) steerable drops to 58\%, and harmonic collapses to 6\% (with numerical instability from high-order terms). This can be explained by the task's robot geometry: the Franka arm has a fixed base; there is no rotational symmetry in the observation-to-action mapping. Imposing equivariance adds representational constraints that conflict with the data.
+\textbf{Observation 2: Equivariance hurts, not helps.} Every rotation-invariant or equivariant backbone underperforms the vanilla MLP encoder. This is not a coincidence. The robot arm has a fixed base. Joint angles are measured in the world frame. When you rotate the scene, the required joint trajectory does \emph{not} rotate with it. The equivariant constraint forces the model to discard absolute orientation---but absolute orientation is critical to solving the task. The result is predictable: 84\% (v3) drops to 58\% (SE2 steerable) or 6\% (harmonic). C8 (73\%) suffers less damage because discrete averaging at 8 angles preserves some orientation information.
 
-\textbf{Observation 3: Augmentation provides no benefit.} Adding relative vectors (48$\rightarrow$60) or SE(2)-invariant features (48$\rightarrow$58) does not improve performance. The extra dimensions may introduce noise or make the model's job harder by diluting useful features.
+\textbf{Observation 3: Augmentation adds noise, not information.} Adding 12 relative vectors (48$\rightarrow$60) or 10 SE(2)-invariant features (48$\rightarrow$58) does not improve performance. This is because forward kinematics is just a sequence of matrix multiplications---a neural network with a few hidden layers can learn this mapping trivially. By pre-computing geometric features, we solved an easy problem for the network, and in doing so we added redundant dimensions that diluted useful signal. The model lost generalization: 84\% $\rightarrow$ 76\% (Naive Aug) and 84\% $\rightarrow$ 68\% (SE2 Aug). \textbf{Do not solve easy problems for the network; it solves them better by itself.}
 
 \textbf{Observation 4: Temporal models underperform.} The temporal diffusion variant (Transformer dual-branch) achieves only 62\%, indicating that for this short-horizon task (median ~70 steps), single-step predictions are sufficient.
 
@@ -228,7 +228,7 @@ Table~\ref{tab:results} presents the full comparison. Diffusion v3 achieves the 
 
 \textbf{Observation 7: Koopman-boosted falls short.} The D3P adaptation yielded 35\% success (DDPM), significantly below the base model. The latent linear dynamics constraint may be too restrictive for this non-stationary task.
 
-\textbf{Observation 8: PID is competitive.} The PID controller achieves 82\%, close to the best learned method. The StackCube task---while requiring precise execution---is structurally well-suited to classical control: clear phases (approach, grasp, lift, place), predictable object positions, and minimal uncertainty.
+\textbf{Observation 8: PID reveals the data ceiling.} The PID controller achieves 82\%, almost matching the best learned method at 84\%. This is the most informative result in the benchmark: \textbf{the model is not the bottleneck.} The failures tell the real story. In difficult spawn configurations, the cube is placed at the edge of the workspace where the arm cannot reach with the correct orientation. What is missing? A pushing primitive---move the cube in from the edge before attempting a grasp. But the PPO expert demonstrations contain almost zero pushing actions. The model cannot learn what it never sees. The 82-84\% plateau is the \textbf{data ceiling}, not the model limit.
 
 \subsection{Loss Landscape Analysis}
 
@@ -245,31 +245,63 @@ Figure~\ref{fig:loss} compares training dynamics across key methods. Diffusion v
 \section{Discussion}
 % ═════════════════════════════════════════════════════════════════════════════
 
-\subsection{Implications for Imitation Learning}
+Our benchmark produces three primary findings, each carrying distinct implications for imitation learning in robotic manipulation.
 
-Our results highlight a crucial insight: \textbf{not all inductive biases benefit all tasks}. While equivariance priors are effective for tasks with clear symmetries (e.g., tabletop pushing with rotational invariance), they become harmful when the assumed symmetry does not match the actual system. The Franka robot's fixed base breaks horizontal translation and rotation symmetries---yet many recent architectures assume SE(2) equivariance.
+\subsection{Equivariance Fails Because the Robot Has a Fixed Base}
 
-The success of the PID controller is particularly noteworthy. It suggests that for strongly-structured tasks with well-defined sub-goals, classical robotics approaches remain viable and often more sample-efficient than learned alternatives.
+A large body of recent work has promoted rotation-equivariant architectures for robotic manipulation \cite{cohen2016steerable,wang2022equivariant}. The motivation appears sound: tabletop manipulation is often symmetric under horizontal rotation. But this assumption breaks for tasks involving a fixed-base serial manipulator.
+
+The Franka Panda robot's joint angles are defined in the world reference frame. If the scene is rotated---say, the target cube moves from $+x$ to $+y$---the required joint trajectory does \emph{not} rotate correspondingly. The robot's shoulder joint does not align its rotation axis with the scene's rotation axis. By imposing SE(2) equivariance, we force the model to discard the absolute orientation of objects, which is precisely the information the robot needs to plan its joint-space trajectory. The result is a systematic degradation: 84\% $\rightarrow$ 58\% for the steerable encoder, and 84\% $\rightarrow$ 68\% for the full SE(2) model.
+
+This finding does not invalidate equivariant methods in general. For tasks where the symmetry matches the system---e.g., end-effector-centric manipulation or multi-fingered grasping---equivariant priors remain valuable. Our contribution is to clearly delineate \emph{when} they apply: only when the symmetry transformation commutes with the action representation.
+
+\subsection{Data Augmentation Adds Noise, Not Information}
+
+We augmented the 48-dimensional state with hand-crafted geometric features: relative vectors, pairwise distances, and height differences. The result was a consistent drop in performance across all three augmentation variants (84\% $\rightarrow$ 76\%, 68\%, 54\%).
+
+The reason is straightforward: forward kinematics is a composition of matrix multiplications. A neural network with 2--3 hidden layers learns this mapping essentially without error during training. By pre-computing these features, we solved a problem the network had already solved for itself. The extra 10--12 dimensions carried no new information; they merely increased the input dimensionality, diluted useful gradients, and made the model more prone to overfitting. This echoes the principle that hand-engineering features for modern deep networks is often counter-productive: if a transformation is differentiable, the network will discover it internally, often more robustly.
+
+\subsection{PID Reveals the Data Ceiling}
+
+The most instructive result is perhaps the simplest: a PID controller with 6-DOF IK achieves 82\% success rate---nearly identical to the best learned policy at 84\%. This has an uncomfortable implication: \textbf{the model is not the bottleneck.}
+
+To understand the true ceiling, examine the failures. In difficult spawn configurations, the cube is placed near the edge of the workspace. At that location, the Franka arm cannot reach with the downward-facing gripper orientation required for a clean grasp. The correct behavior is a \emph{pushing primitive}: drag the cube inward first, then grasp. However, the PPO expert demonstrations used to train all our models contain almost zero pushing actions. The 932 trajectories overwhelmingly depict direct pick-and-place from reachable configurations.
+
+This is the \textbf{data ceiling}. The model cannot learn what it never sees. All 18 learned methods, regardless of architecture, converge to roughly the same 76--84\% plateau because they share the same data. The four-point gap between BC (76\%) and Diffusion v3 (84\%) reflects the better multi-modal distribution coverage of diffusion, but neither surpasses the fundamental limit set by the data.
+
+There are two paths forward. The first is to collect or generate expert data that includes pushing primitives, either by modifying the PPO reward to incentivize pushing or by human teleoperation in challenging spawns. The second is online fine-tuning: a diffusion policy that occasionally explores pushing actions can discover these missing behaviors through trial and error, much as RL discovers emergent behaviors that the dataset does not contain.
 
 \subsection{Failure Analysis}
 
-\textbf{Flow Matching.} The complete failure (0\%) likely stems from training instability. The linear interpolation path assumes the velocity field is well-behaved, but contact-rich stacking involves sharp discontinuities (e.g., the moment of grasp contact). Diffusion models' stochastic denoising path better handles such discontinuities.
+\textbf{Flow Matching (0\%).} The complete failure likely stems from training instability. The linear interpolation path assumes the velocity field is well-behaved throughout, but contact-rich stacking involves sharp discontinuities---the moment of grasp contact, the sudden change from pre-grasp approach to lifting. The diffusion model's stochastic denoising path has a built-in robustness to such discontinuities; the deterministic ODE path of flow matching does not.
 
-\textbf{Koopman-boosted diffusion.} The D3P approach was designed for visual input and out-of-distribution robustness. On state-based input, the latent linear dynamics constraint may be too restrictive. The 35\% success rate suggests the Koopman linearity assumption does not hold for the StackCube action space.
+\textbf{Koopman-boosted diffusion (35\%).} The D3P approach \cite{huang2025d3p} was designed for visual input and out-of-distribution robustness. Applied to state-based input, the latent linear dynamics assumption proves too restrictive. StackCube is inherently non-stationary: a successful grasp fundamentally changes the system state. Linearizing these dynamics discards the very structure that makes the task solvable.
+
+\textbf{Entity-Aware attention (32--58\%).} With 5.8M parameters on only 36K training samples, overfitting is inevitable. The lightweight variants (3.3M) improve somewhat but still lag. Attention mechanisms may be ill-suited to the low-data regime of robotic imitation learning.
 
 \subsection{Limitations}
 
-Our study has several limitations. First, the expert data comes from a single PPO policy; the diversity of demonstrations is limited. Second, evaluation uses 50--100 episodes per method, which provides reasonable statistical power but not exhaustive coverage. Third, hyperparameter tuning is not exhaustive---further gains may be achievable with more systematic search.
+Our study has several limitations. First, the expert data comes from a single PPO policy; the diversity of demonstrations is limited. Second, evaluation uses 50--100 episodes per method, which provides reasonable statistical power but not exhaustive coverage. Third, hyperparameter tuning is not exhaustive---further gains may be achievable with more systematic search. Fourth, the PID controller uses environment state (object positions, joint angles) and would not transfer to vision-based input.
 
 \subsection{Future Work}
 
-Promising directions include: (1) combined RL fine-tuning of diffusion policies; (2) online data aggregation (DAgger-style) to address distribution shift; (3) hierarchical approaches that decompose stacking into discrete phases with specialized controllers; and (4) investigation of why Flow Matching fails and whether modified training objectives can stabilize it.
+The data ceiling finding suggests the most promising direction is not a better architecture, but better data. Specific next steps include: (1) augmenting the dataset with pushing actions collected from human teleoperation or modified PPO rewards; (2) online RL fine-tuning of pre-trained diffusion policies to discover pushing primitives; (3) hierarchical policies that first classify spawn difficulty and dispatch a pushing or direct-pick sub-policy accordingly; and (4) investigating why Flow Matching fails on contact-rich tasks and whether anti-windup or adaptive step-size ODE solvers can stabilize training.
 
 % ═════════════════════════════════════════════════════════════════════════════
 \section{Conclusion}
 % ═════════════════════════════════════════════════════════════════════════════
 
-We comprehensively benchmarked 18 methods on ManiSkill3 StackCube-v1, finding that: (1) diffusion v3 achieves the best learned policy at 84\% success rate through careful scaling of capacity and training techniques; (2) PID control achieves 82\%, highlighting the continued relevance of classical control; (3) all equivariant, temporal, and entity-aware architectures underperform the baseline; (4) Flow Matching fails on this contact-rich task; and (5) the Koopman-boosted diffusion approach underperforms. These results provide practical guidance for imitation learning on structurally-constrained manipulation tasks.
+We comprehensively benchmarked 18 methods on ManiSkill3 StackCube-v1. Our key findings are:
+
+\begin{enumerate}
+    \item Diffusion v3 achieves the best learned policy at 84\% through careful scaling of capacity and training techniques.
+    \item PID control achieves 82\%, nearly matching the best learned method. \textbf{The model is not the bottleneck---82-84\% is the data ceiling}, set by the absence of pushing primitives in the expert demonstrations.
+    \item Rotation-equivariant backbones uniformly underperform because the fixed-base robot's joint angles are defined in the world frame; equivariance forces the model to discard orientation information that is essential for planning.
+    \item Hand-crafted geometric features add noise, not information, since forward kinematics is trivially learned by the network.
+    \item Temporal, entity-aware, Flow Matching, and Koopman-boosted approaches all fail to exceed the baseline.
+\end{enumerate}
+
+These results provide practical guidance: for structurally-constrained manipulation tasks, improving data diversity---particularly by collecting missing behaviors such as pushing---is likely more impactful than further architectural innovation.
 
 % ═════════════════════════════════════════════════════════════════════════════
 \bibliographystyle{unsrt}
