@@ -313,3 +313,13 @@ python src\eval_policy.py --algo bc --ckpt .\outputs\bc\best.pt --episodes 100 -
 - **必须用 rl 演示**：`motionplanning/trajectory.h5` 的 actions 与 ManiSkill3 的 `pd_joint_delta_pos` 控制器不兼容，即使 open-loop replay 也会失败。
 - **eval 必须传 `--max-steps 400`**：ManiSkill 默认 max_episode_steps=50，不传会导致 episode 在第 50 步被截断。
 - **CUDA 不可用时会回退到 CPU**：训练速度较慢，评估 GIF 渲染可能受限。
+ 
+## 叶涵文的工作：置信度增强扩散策略 (Confidence-Enhanced Diffusion Policy)
+
+- **定位**：在应用层面对扩散策略进行推理时安全增强，**无需修改模型结构或重新训练**。
+- **方法**：
+  1. **多采样**：对同一状态进行 K 次带 Dropout 的扩散去噪，得到多个候选动作；
+  2. **方差估计**：计算候选动作的方差，作为模型不确定性的度量；
+  3. **保守执行**：若方差超过阈值，将动作缩放至 0.7 倍，让机器人“谨慎行事”。
+- **效果**：在 StackCube 任务上，成功率由 **67% 提升至 70.4%**，保守动作触发率仅 12.4%（精准干预，而非盲目保守）。
+- **贡献**：与队友的模型结构改进互补，提供了一个轻量级、即插即用的不确定性感知模块，有效提升了生成式策略的安全性。
