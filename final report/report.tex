@@ -105,12 +105,16 @@ To test whether explicitly providing geometric features improves learning, we au
 \subsection{Rotation-Equivariant Backbones}
 \label{sec:equiv}
 
-We modify the observation encoder component of the NoisePredictor to impose rotation invariance or equivariance. All variants use the v1 training configuration (hidden=256, depth=4) for fair comparison:
+We modify the observation encoder component of the NoisePredictor to impose rotation invariance or equivariance. Variants No.~7--10 use the v1 training configuration (hidden=256, depth=4) for fair comparison. Additionally, we implement a stand-alone SE(2) model (No.~11) with a custom architecture:
 
 \begin{itemize}
     \item \textbf{C4/C8 (No.~7):} Discrete cyclic group averaging. The first $P$ dimensions are interpreted as $(x,y)$ vector pairs, rotated by $n$ discrete angles in $\{0, 2\pi/n, \ldots\}$, encoded independently, and average-pooled. For C8, $n=8$, pair-dim is automatic.
-    \item \textbf{SE(2) Steerable (No.~8):} Continuous SE(2) steerable encoder. Vector pairs are mapped through $a\mathbf{I}+b\mathbf{J}$ steerable linear maps (where $\mathbf{J}$ is the 90\deg rotation matrix). Scalar features and vector norms are processed separately.
-    \item \textbf{Harmonic (No.~9):} Complex harmonic Fourier features. For each vector pair, we compute moments $C_m = \mathbb{E}[r^m e^{i m\theta}]$ up to order M=4, retaining real/imaginary/magnitude components.
+
+    \item \textbf{SE(2) Steerable (No.~8):} Continuous SE(2) steerable encoder (\texttt{SE2SteerableObsEncoder}). The first $P$ dimensions are treated as $(x,y)$ vector pairs. The steerable linear layer applies $y = a \cdot v + b \cdot \mathbf{J}v$, where $\mathbf{J}$ is the $90^\circ$ rotation matrix. An iterative interaction between vector and scalar branches computes the rotation-invariant output: vector features are modulated by a gating signal from the scalar branch, and scalar features are updated with vector norms at each iteration.
+
+    \item \textbf{Harmonic (No.~9--10):} Complex harmonic Fourier features. For each vector pair, we compute moments $C_m = \mathbb{E}[r^m e^{i m\theta}]$ up to order $M=4$, retaining real/imaginary/magnitude components. No.~10 applies pred\_x0 clamping to prevent numerical collapse.
+
+    \item \textbf{SE(2) Diffusion v3 (No.~11):} A stand-alone SE(2)-equivariant policy with a custom architecture (\texttt{BCDiffusionSE2}). It computes end-effector position via forward kinematics, extracts four keypoints (EE, cubeA, cubeB, goal) in the horizontal plane, and encodes pairwise distances and z-coordinates as SE(2)-invariant features. The SE(2) branch is fused with joint-velocity and gripper signals, and the model uses the same v3 training configuration (hidden=384, depth=6, cosine schedule, EMA, SWA). The input is 60-dimensional (48 original + 12 SE2 features).
 \end{itemize}
 
 \subsection{Temporal and Entity-Aware Variants}
@@ -136,7 +140,7 @@ A learnable group action operator $T_{\phi}(h, g)$ with soft consistency loss $\
 \subsection{Deep Koopman-Boosted Diffusion (D3P)}
 \label{sec:koopman}
 
-Following Huang et al.\ \cite{huang2025d3p}, we implement a state-based Deep Koopman-boosted Diffusion Policy (No.~4, DKO variant). The Koopman Dynamics Module learns a latent linear system:
+Following Huang et al.\ \cite{huang2025d3p}, we implement a state-based Deep Koopman-boosted Diffusion Policy (DKO variant, not included in the main numbered list). The Koopman Dynamics Module learns a latent linear system:
 
 \begin{equation}
     z_t = E_{\phi}(\text{obs\_seq}_t), \quad
