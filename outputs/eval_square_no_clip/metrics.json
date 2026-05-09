@@ -1,0 +1,8 @@
+{
+  "success_rate": 0.0,
+  "avg_return": 46.153552217408375,
+  "avg_ep_len": 400.0,
+  "episodes": 100,
+  "env_id": "NutAssemblySquare",
+  "robot": "Panda"
+}

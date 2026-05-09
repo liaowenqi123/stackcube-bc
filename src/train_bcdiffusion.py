@@ -36,13 +36,17 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from common import RunningNormalizer, ensure_dir, load_npz_dataset, select_device, split_idx
+from common import RunningNormalizer, ensure_dir, load_dataset_auto, select_device, split_idx
 from models import BCDiffusion, EMA
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset",           required=True)
+    p.add_argument("--action-key",        type=str,   default="actions",
+                   help="action dataset key when loading hdf5")
+    p.add_argument("--obs-keys",          nargs="+",  default=None,
+                   help="ordered observation keys when loading hdf5")
     p.add_argument("--outdir",            required=True)
     p.add_argument("--epochs",            type=int,   default=500)
     p.add_argument("--batch-size",        type=int,   default=512)
@@ -77,7 +81,7 @@ def main() -> None:
     np.random.seed(args.seed)
 
     # ── 加载数据 ─────────────────────────────────────────────────────────────
-    data  = load_npz_dataset(args.dataset)
+    data  = load_dataset_auto(args.dataset, obs_keys=args.obs_keys, action_key=args.action_key)
     x_raw = data["obs"].astype(np.float32)
     y_raw = data["acts"].astype(np.float32)
     train_idx, val_idx = split_idx(len(x_raw), val_ratio=0.1, seed=args.seed)

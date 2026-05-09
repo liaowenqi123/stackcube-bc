@@ -1,0 +1,35 @@
+﻿{
+  "task_name": "NutAssemblyRound",
+  "robot": "Panda",
+  "controller": "OSC_POSE",
+  "obs_keys": [
+    "robot0_eef_pos",
+    "robot0_eef_quat",
+    "robot0_gripper_qpos",
+    "robot0_joint_pos_cos",
+    "robot0_joint_pos_sin",
+    "robot0_joint_vel",
+    "object-state"
+  ],
+  "train": {
+    "dataset": "./data/processed/nutassemblyround_state.npz",
+    "outdir": "./outputs/nutassemblyround_diffusion_v1",
+    "epochs": 300,
+    "batch_size": 512,
+    "lr": 1e-4,
+    "hidden": 256,
+    "depth": 4,
+    "scheduler": "linear",
+    "ema_decay": 0.0,
+    "action_noise_std": 0.0
+  },
+  "eval": {
+    "episodes": 100,
+    "max_steps": 400,
+    "sampler": "ddim",
+    "t_inf": 20,
+    "eta": 0.0,
+    "action_clip": 0.5,
+    "output_dir": "./outputs/eval_nutassemblyround_v1"
+  }
+}
