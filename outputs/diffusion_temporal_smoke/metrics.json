@@ -1,0 +1,36 @@
+{
+  "best_val_loss": 0.31176338686436134,
+  "train_loss": [
+    0.5251175942537668,
+    0.31436190978213624
+  ],
+  "val_loss": [
+    0.3388855236120267,
+    0.31176338686436134
+  ],
+  "args": {
+    "dataset": ".\\data\\processed\\stackcube_rl_state.npz",
+    "outdir": ".\\outputs\\diffusion_temporal_smoke",
+    "epochs": 2,
+    "batch_size": 256,
+    "lr": 0.0001,
+    "seed": 42,
+    "weight_decay": 1e-05,
+    "grad_clip": 1.0,
+    "T": 100,
+    "beta_min": 0.0001,
+    "beta_max": 0.02,
+    "hidden": 256,
+    "depth": 4,
+    "scheduler": "linear",
+    "temporal": true,
+    "seq_len": 8,
+    "tf_layers": 2,
+    "tf_heads": 4,
+    "tf_dropout": 0.1,
+    "router_hidden": 128,
+    "ema_decay": 0.0,
+    "action_noise_std": 0.01,
+    "swa_start": 9999
+  }
+}
