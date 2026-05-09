@@ -1,453 +1,341 @@
+r"""
+train_bcdiffusion.py - BC Diffusion Policy training script with optional Koopman DKO.
+Usage:
+    python src/train_bcdiffusion.py --data data/processed/stackcube_rl_state.npz --koopman
 """
-train_bcdiffusion.py
-====================
-Diffusion Policy (DDPM + DDIM) 训练脚本。
-
-改进点（v2 vs v1）：
-  1. EMA 权重平均（decay=0.999）— 大幅提升推理质量
-  2. Cosine Beta Schedule — 更平滑的噪声调度
-  3. Action Noise Augmentation — 训练时对 action 加噪，提升鲁棒性
-  4. SWA（随机权重平均）— 最终几个 epoch 平均权重
-  5. 支持 scheduler="cosine"|"linear"
-  6. hidden=384, depth=6（增大模型容量）
-  7. 更长训练（500 epochs）
-
-用法示例（PowerShell）：
-    python src\train_bcdiffusion.py `
-        --dataset .\data\processed\stackcube_rl_state.npz `
-        --outdir .\outputs\diffusion_v2 `
-        --epochs 500 `
-        --batch-size 512 `
-        --lr 1e-4 `
-        --hidden 384 `
-        --depth 6 `
-        --ema-decay 0.999 `
-        --scheduler cosine `
-        --action-noise-std 0.01
-"""
-from __future__ import annotations
-
+import os
+import math
 import argparse
-import json
-from pathlib import Path
-from typing import List, Tuple
-
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common import RunningNormalizer, ensure_dir, load_npz_dataset, select_device, split_idx
-from models import BCDiffusion, BCDiffusionTemporal, EMA
+from src.models import BCDiffusionKoopman, BCDiffusion
 
+# ------------------------------------------------------------
+# Diffusion helpers (cosine schedule + extract)
+# ------------------------------------------------------------
 
-class TemporalStepDataset(Dataset):
-    """
-    构建多步输入、单步监督样本：
-    输入: obs_seq (L, D), obs_mask (L,)
-    监督: 当前时刻 obs_t, act_t
-    """
+def cosine_beta_schedule(timesteps, s=0.008):
+    """Cosine beta schedule as proposed in Nichol & Dhariwal (2021)."""
+    steps = torch.arange(timesteps + 1, dtype=torch.float32) / timesteps
+    alphas_cumprod = torch.cos((steps + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0.0001, 0.9999)
 
-    def __init__(self, obs: np.ndarray, acts: np.ndarray,
-                 starts: np.ndarray, lengths: np.ndarray, seq_len: int):
-        self.samples: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-        for s, l in zip(starts.tolist(), lengths.tolist()):
-            ep_obs = obs[s:s + l]
-            ep_act = acts[s:s + l]
-            for t in range(l):
-                left = max(0, t - seq_len + 1)
-                seq = ep_obs[left:t + 1]
-                n = seq.shape[0]
-                seq_pad = np.zeros((seq_len, obs.shape[1]), dtype=np.float32)
-                mask = np.zeros((seq_len,), dtype=np.bool_)
-                seq_pad[-n:] = seq
-                mask[-n:] = True
-                self.samples.append((
-                    seq_pad.astype(np.float32),
-                    mask,
-                    ep_obs[t].astype(np.float32),
-                    ep_act[t].astype(np.float32),
-                ))
+def extract(a, t, x_shape):
+    """Extract values from a (timestep array) at indices t, reshape to x_shape."""
+    b, *_ = t.shape
+    out = a.gather(-1, t).reshape(b, *((1,) * (len(x_shape) - 1)))
+    return out
 
-    def __len__(self) -> int:
-        return len(self.samples)
+# ------------------------------------------------------------
+# Dataset
+# ------------------------------------------------------------
+class BCDataset(Dataset):
+    def __init__(self, data_path, seq_len=4):
+        dat = np.load(data_path)
+        self.obs = dat["obs"]   # (N, obs_dim)
+        self.acts = dat["acts"]   # (N, act_dim)
+        self.seq_len = seq_len
+        # obs is per-step; we form sequences by taking consecutive rows
+        # For sequence starting at i, obs_seq = obs[i : i+seq_len]
+        # target act = acts[i+seq_len-1]  (last step in sequence)
+        self.num_samples = len(self.obs) - seq_len
+        print(f"[Dataset] obs={self.obs.shape}, acts={self.acts.shape}, "
+              f"seq_len={seq_len}, samples={self.num_samples}")
 
-    def __getitem__(self, idx: int):
-        seq, mask, obs_t, act_t = self.samples[idx]
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # obs_seq: (seq_len, obs_dim)
+        obs_seq = self.obs[idx : idx + self.seq_len]
+        act = self.acts[idx + self.seq_len - 1]
         return (
-            torch.from_numpy(seq),
-            torch.from_numpy(mask),
-            torch.from_numpy(obs_t),
-            torch.from_numpy(act_t),
+            torch.from_numpy(obs_seq.astype(np.float32)),
+            torch.from_numpy(act.astype(np.float32)),
         )
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset",           required=True)
-    p.add_argument("--outdir",            required=True)
-    p.add_argument("--epochs",            type=int,   default=500)
-    p.add_argument("--batch-size",        type=int,   default=512)
-    p.add_argument("--lr",                type=float, default=1e-4)
-    p.add_argument("--seed",              type=int,   default=42)
-    p.add_argument("--weight-decay",      type=float, default=1e-5)
-    p.add_argument("--grad-clip",         type=float, default=1.0)
-    # ── Diffusion 超参 ──────────────────────────────────────────────────────
-    p.add_argument("--T",               type=int,   default=100,
-                   help="DDPM 训练扩散步数")
-    p.add_argument("--beta-min",        type=float, default=1e-4)
-    p.add_argument("--beta-max",        type=float, default=2e-2)
-    p.add_argument("--hidden",          type=int,   default=384,
-                   help="NoisePredictor 隐层宽度")
-    p.add_argument("--depth",           type=int,   default=6,
-                   help="NoisePredictor 层数")
-    p.add_argument("--scheduler",       type=str,   default="cosine",
-                   choices=["linear", "cosine"],
-                   help="Beta schedule：cosine 更平滑（推荐）")
-    p.add_argument("--temporal", action="store_true",
-                   help="启用时序分支（Transformer）进行多步输入单步输出")
-    p.add_argument("--seq-len",         type=int,   default=8,
-                   help="时序输入长度 L（仅 temporal 模式生效）")
-    p.add_argument("--tf-layers",       type=int,   default=2,
-                   help="TransformerEncoder 层数（仅 temporal 模式）")
-    p.add_argument("--tf-heads",        type=int,   default=4,
-                   help="Transformer 多头数（仅 temporal 模式）")
-    p.add_argument("--tf-dropout",      type=float, default=0.1,
-                   help="Transformer dropout（仅 temporal 模式）")
-    p.add_argument("--router-hidden",   type=int,   default=128,
-                   help="路由门控隐藏层宽度（仅 temporal 模式）")
-    p.add_argument("--obs-backbone",    type=str,   default="mlp",
-                   choices=["mlp", "c4", "c8", "se2", "harmonic"],
-                   help="观测编码骨干：mlp（默认）或 c4/c8/se2/harmonic（旋转等变/不变）")
-    p.add_argument("--c4-pair-dim", "--rot-pair-dim", dest="rot_pair_dim", type=int, default=-1,
-                   help="旋转不变模式下按(x,y)成对处理的前缀维度，-1 表示自动取最大偶数维")
-    p.add_argument("--harmonic-order", type=int, default=4,
-                   help="harmonic 骨干的最高谐波阶数 M")
-    # ── EMA ────────────────────────────────────────────────────────────────
-    p.add_argument("--ema-decay",       type=float, default=0.999,
-                   help="EMA decay 系数（0.999 推荐，0=禁用 EMA）")
-    # ── 数据增强 ──────────────────────────────────────────────────────────
-    p.add_argument("--action-noise-std", type=float, default=0.01,
-                   help="训练时对 action 加噪的标准差（0=禁用，推荐 0.01）")
-    # ── SWA ────────────────────────────────────────────────────────────────
-    p.add_argument("--swa-start",       type=int,   default=450,
-                   help="SWA 开始 epoch（推荐总 epoch 数的最后 10%%）")
-    args = p.parse_args()
+# ------------------------------------------------------------
+# EMA (Exponential Moving Average)
+# ------------------------------------------------------------
+class EMA:
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {k: v.clone() for k, v in model.state_dict().items()}
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    def update(self):
+        for k, v in self.model.state_dict().items():
+            self.shadow[k] = self.decay * self.shadow[k] + (1 - self.decay) * v
 
-    # ── 加载数据 ─────────────────────────────────────────────────────────────
-    data  = load_npz_dataset(args.dataset)
-    x_raw = data["obs"].astype(np.float32)
-    y_raw = data["acts"].astype(np.float32)
-    starts = data.get("ep_starts")
-    lengths = data.get("ep_lengths")
+    def apply_shadow(self):
+        self.model.load_state_dict(self.shadow)
 
-    if args.temporal:
-        if starts is None or lengths is None:
-            raise KeyError("temporal mode requires ep_starts and ep_lengths in dataset npz")
-        n_ep = len(starts)
-        ep_train, ep_val = split_idx(n_ep, val_ratio=0.1, seed=args.seed)
-        train_mask = np.zeros(len(x_raw), dtype=bool)
-        for s, l in zip(starts[ep_train].tolist(), lengths[ep_train].tolist()):
-            train_mask[s:s + l] = True
-        print(f"Dataset (temporal): {len(ep_train)} train episodes / {len(ep_val)} val episodes")
-    else:
-        train_idx, val_idx = split_idx(len(x_raw), val_ratio=0.1, seed=args.seed)
-        train_mask = np.zeros(len(x_raw), dtype=bool)
-        train_mask[train_idx] = True
-        print(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
-    print(f"obs_dim={x_raw.shape[1]}  act_dim={y_raw.shape[1]}")
+    def state_dict(self):
+        return self.shadow
 
-    # ── 归一化（fit 仅在训练集）───────────────────────────────────────────
-    obs_norm = RunningNormalizer(const_thresh=1e-3)
-    obs_norm.fit(x_raw[train_mask])
-    act_norm = RunningNormalizer(const_thresh=0.0)
-    act_norm.fit(y_raw[train_mask])
+    def load_state_dict(self, state):
+        self.shadow = {k: v.clone() for k, v in state.items()}
 
-    x = obs_norm.transform(x_raw)
-    y = act_norm.transform(y_raw)
 
-    if args.temporal:
-        train_ds = TemporalStepDataset(x, y, starts[ep_train], lengths[ep_train], args.seq_len)
-        val_ds = TemporalStepDataset(x, y, starts[ep_val], lengths[ep_val], args.seq_len)
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=0,
-            pin_memory=True,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
-    else:
-        x_train = torch.from_numpy(x[train_idx])
-        y_train = torch.from_numpy(y[train_idx])
-        x_val   = torch.from_numpy(x[val_idx])
-        y_val   = torch.from_numpy(y[val_idx])
+# ------------------------------------------------------------
+# SWA (Stochastic Weight Averaging) helper
+# ------------------------------------------------------------
+def swa_update(swa_model, current_model, n_swa_updates):
+    """Update SWA buffered params."""
+    with torch.no_grad():
+        n = n_swa_updates
+        for (name, p_swa), (_, p_cur) in zip(
+            swa_model.named_parameters(), current_model.named_parameters()
+        ):
+            p_swa.data = (p_swa.data * n + p_cur.data) / (n + 1)
 
-        train_loader = DataLoader(
-            TensorDataset(x_train, y_train),
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=0,
-            pin_memory=True,
-        )
-        val_loader = DataLoader(
-            TensorDataset(x_val, y_val),
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
 
-    # ── 模型 ─────────────────────────────────────────────────────────────────
-    device = select_device()
-    rot_pair_dim = None if args.rot_pair_dim < 0 else int(args.rot_pair_dim)
-    if args.temporal:
-        model = BCDiffusionTemporal(
-            obs_dim=x.shape[1],
-            act_dim=y.shape[1],
+# ------------------------------------------------------------
+# main
+# ------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="BC Diffusion Policy Training")
+    # data
+    parser.add_argument("--data", type=str, default="data/processed/stackcube_rl_state.npz")
+    parser.add_argument("--seq-len", type=int, default=4)
+    # model
+    parser.add_argument("--hidden", type=int, default=384)
+    parser.add_argument("--depth", type=int, default=6)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--koopman", action="store_true", help="Enable Koopman DKO branch")
+    parser.add_argument("--koopman-h", type=int, default=4,
+                        help="DKO history length h (seq_len = 2h+1 = 9)")
+    parser.add_argument("--koopman-warmup-epochs", type=int, default=50,
+                        help="Freeze DKO params for first N epochs, then joint train")
+    parser.add_argument("--use-dko", action="store_true", default=True,
+                        help="Use DKO modulation during sampling (default: True)")
+    # diffusion
+    parser.add_argument("--T", type=int, default=100)
+    parser.add_argument("--T-inf", type=int, default=20)
+    parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddpm", "ddim"])
+    # training
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--ema", action="store_true", default=True)
+    parser.add_argument("--swa", action="store_true", default=True)
+    parser.add_argument("--swa-start", type=int, default=150)
+    # logging / saving
+    parser.add_argument("--save-interval", type=int, default=50)
+    parser.add_argument("--eval-interval", type=int, default=50)
+    parser.add_argument("--output-dir", type=str, default="outputs/diffusion_koopman")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num-workers", type=int, default=4)
+    args = parser.parse_args()
+
+    # auto-set seq_len for koopman mode: needs 2h+1 frames
+    if args.koopman:
+        args.seq_len = args.koopman_h * 2 + 1
+        print(f"[Koopman] seq_len auto-set to {args.seq_len} (h={args.koopman_h})")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # dataset
+    dataset = BCDataset(args.data, seq_len=args.seq_len)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True,
+    )
+
+    # ── 归一化统计量 ────────────────────────────────────────────────
+    # 从全量数据计算，并转为 torch Tensor（v3 训练也这样做的）
+    obs_mean = torch.from_numpy(dataset.obs.mean(0).astype(np.float32)).to(device)
+    obs_std  = torch.from_numpy(dataset.obs.std(0).clip(min=1e-6).astype(np.float32)).to(device)
+    act_mean = torch.from_numpy(dataset.acts.mean(0).astype(np.float32)).to(device)
+    act_std  = torch.from_numpy(dataset.acts.std(0).clip(min=1e-6).astype(np.float32)).to(device)
+    print(f"[Norm] obs μ={obs_mean[:3].cpu().numpy()} σ={obs_std[:3].cpu().numpy()}")
+    print(f"[Norm] act μ={act_mean.cpu().numpy()}  σ={act_std.cpu().numpy()}")
+    # 转成 list 存 checkpoint（eval 需要）
+    obs_norm_state = {
+        "mean": dataset.obs.mean(0).tolist(),
+        "std": dataset.obs.std(0).clip(min=1e-6).tolist(),
+        "valid_mask": [True] * dataset.obs.shape[1],
+        "eps": 1e-8,
+        "const_thresh": 1e-3,
+    }
+    act_norm_state = {
+        "mean": dataset.acts.mean(0).tolist(),
+        "std": dataset.acts.std(0).clip(min=1e-6).tolist(),
+        "valid_mask": [True] * dataset.acts.shape[1],
+        "eps": 1e-8,
+        "const_thresh": 1e-3,
+    }
+
+    # model
+    obs_dim = dataset.obs.shape[1]   # 48
+    act_dim = dataset.acts.shape[1]   # 8
+    print(f"obs_dim={obs_dim}, act_dim={act_dim}")
+
+    if args.koopman:
+        model = BCDiffusionKoopman(
+            obs_dim=obs_dim, act_dim=act_dim,
+            hidden=args.hidden, depth=args.depth,
             T=args.T,
-            beta_min=args.beta_min,
-            beta_max=args.beta_max,
-            hidden=args.hidden,
-            depth=args.depth,
-            scheduler=args.scheduler,
-            seq_len=args.seq_len,
-            tf_layers=args.tf_layers,
-            tf_heads=args.tf_heads,
-            tf_dropout=args.tf_dropout,
-            router_hidden=args.router_hidden,
-            obs_backbone=args.obs_backbone,
-            rot_pair_dim=rot_pair_dim,
-            harmonic_order=args.harmonic_order,
         ).to(device)
     else:
         model = BCDiffusion(
-            obs_dim=x.shape[1],
-            act_dim=y.shape[1],
-            T=args.T,
-            beta_min=args.beta_min,
-            beta_max=args.beta_max,
-            hidden=args.hidden,
-            depth=args.depth,
-            scheduler=args.scheduler,
-            obs_backbone=args.obs_backbone,
-            rot_pair_dim=rot_pair_dim,
-            harmonic_order=args.harmonic_order,
+            obs_dim=obs_dim, act_dim=act_dim,
+            hidden=args.hidden, depth=args.depth, heads=args.heads,
+            T=args.T, seq_len=args.seq_len,
         ).to(device)
 
-    # ── EMA ──────────────────────────────────────────────────────────────────
-    use_ema  = args.ema_decay > 0
-    ema_shadow = None
-    if use_ema:
-        ema_shadow = EMA(model, decay=args.ema_decay, device=device)
-        print(f"EMA enabled: decay={args.ema_decay}")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model params: {n_params:,}")
 
-    # ── Optimizer + Scheduler ────────────────────────────────────────────────
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    total_steps = args.epochs * len(train_loader)
-    warmup_steps = int(0.1 * total_steps)
+    # optimizer
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(loader))
 
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + np.cos(np.pi * progress)) * (1 - 1 / 20) + 1 / 20
+    # EMA / SWA
+    ema = EMA(model) if args.ema else None
+    swa_model = None
+    n_swa_updates = 0
+    if args.swa:
+        swa_model = BCDiffusionKoopman(
+            obs_dim=obs_dim, act_dim=act_dim,
+            hidden=args.hidden, depth=args.depth,
+            T=args.T,
+        ).to(device) if args.koopman else BCDiffusion(
+            obs_dim=obs_dim, act_dim=act_dim,
+            hidden=args.hidden, depth=args.depth, heads=args.heads,
+            T=args.T, seq_len=args.seq_len,
+        ).to(device)
+        swa_model.load_state_dict(model.state_dict())
+        for p in swa_model.parameters():
+            p.requires_grad = False
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    # ----------------------------------------------------------------
+    # Warmup helper: freeze / unfreeze DKO params
+    # ----------------------------------------------------------------
+    def _set_dko_grad(model, requires_grad):
+        """Freeze/unfreeze all Koopman DKO related parameters."""
+        if not hasattr(model, "dko"):
+            return
+        for p in model.dko.parameters():
+            p.requires_grad = requires_grad
+        for p in model.noise_pred.f_u_modulators.parameters():
+            p.requires_grad = requires_grad
+        status = "trainable" if requires_grad else "FROZEN"
+        print(f"  [DKO] params set to: {status}")
 
-    # ── SWA ──────────────────────────────────────────────────────────────────
-    swa_start  = args.swa_start
-    swa_active = False
-    swa_count  = 0
-    swa_buffer = {name: torch.zeros_like(p.data) for name, p in model.named_parameters() if p.requires_grad}
+    # start with warmup (freeze DKO) if requested
+    if args.koopman and args.koopman_warmup_epochs > 0:
+        print(f"[Warmup] Freezing DKO params for first {args.koopman_warmup_epochs} epochs")
+        _set_dko_grad(model, requires_grad=False)
 
-    # ── 训练循环 ─────────────────────────────────────────────────────────────
-    outdir      = ensure_dir(args.outdir)
-    best        = float("inf")
-    best_path   = outdir / "best.pt"
-    train_curve = []
-    val_curve   = []
-    global_step = 0
-
+    # ----------------------------------------------------------------
+    # Training loop
+    # ----------------------------------------------------------------
     for epoch in range(1, args.epochs + 1):
-        # ── Train ──
         model.train()
-        train_loss = 0.0
-        n_samples  = 0
-        for batch in train_loader:
-            if args.temporal:
-                seqb, maskb, xb, yb = batch
-                seqb = seqb.to(device)
-                maskb = maskb.to(device)
-                xb = xb.to(device)
-                yb = yb.to(device)
-                loss = model(xb, yb, obs_seq=seqb, obs_mask=maskb, action_noise_std=args.action_noise_std)
+        total_loss = 0.0
+        n_batches = 0
+
+        # switch from warmup to joint training
+        if args.koopman and args.koopman_warmup_epochs > 0 and epoch == args.koopman_warmup_epochs + 1:
+            print(f"[JointTraining] Unfreezing DKO params at epoch {epoch}")
+            _set_dko_grad(model, requires_grad=True)
+
+        for obs_seq, act in loader:
+            obs_seq = obs_seq.to(device)   # (B, seq_len, obs_dim)
+            act = act.to(device)           # (B, act_dim)
+
+            # ── 归一化（与 eval 一致） ────────────────────────────────
+            obs_seq = (obs_seq - obs_mean) / obs_std
+            act     = (act - act_mean) / act_std
+
+            # forward - model returns scalar loss internally
+            if args.koopman:
+                disable_dko = (epoch <= args.koopman_warmup_epochs) if args.koopman_warmup_epochs > 0 else False
+                loss = model(obs_seq[:, -1, :], act, obs_seq=obs_seq if not disable_dko else None, disable_dko=disable_dko)
             else:
-                xb, yb = batch
-                xb = xb.to(device)
-                yb = yb.to(device)
-                loss = model(xb, yb, action_noise_std=args.action_noise_std)
-            opt.zero_grad(set_to_none=True)
+                loss = model(obs_seq[:, -1, :], act)
+
+            opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             scheduler.step()
-            global_step += 1
-            train_loss  += loss.item() * xb.size(0)
-            n_samples   += xb.size(0)
 
-            # EMA 更新（每步）
-            if ema_shadow is not None:
-                ema_shadow.update()
+            if ema:
+                ema.update()
 
-            # SWA 累加
-            if swa_active:
-                for (name, p), buf in zip(model.named_parameters(), swa_buffer.values()):
-                    buf.add_(p.data)
-                swa_count += 1
+            total_loss += loss.item()
+            n_batches += 1
 
-        train_loss /= n_samples
+        avg_loss = total_loss / max(n_batches, 1)
 
-        # ── Val ──
-        model.eval()
-        val_loss = 0.0
-        v_samples = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                if args.temporal:
-                    seqb, maskb, xb, yb = batch
-                    seqb = seqb.to(device)
-                    maskb = maskb.to(device)
-                    xb = xb.to(device)
-                    yb = yb.to(device)
-                    batch_loss = model(xb, yb, obs_seq=seqb, obs_mask=maskb).item()
-                else:
-                    xb, yb = batch
-                    xb = xb.to(device)
-                    yb = yb.to(device)
-                    batch_loss = model(xb, yb).item()
-                val_loss += batch_loss * xb.size(0)
-                v_samples += xb.size(0)
-        val_loss /= v_samples
+        # SWA snapshot
+        if args.swa and epoch >= args.swa_start:
+            n_swa_updates += 1
+            swa_update(swa_model, model, n_swa_updates)
 
-        train_curve.append(float(train_loss))
-        val_curve.append(float(val_loss))
+        # logging
+        if epoch % 10 == 0 or epoch == 1:
+            lr_now = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch:4d}/{args.epochs}  loss={avg_loss:.6f}  lr={lr_now:.6f}")
 
-        lr_now = scheduler.get_last_lr()[0]
-        marker = " [SWA]" if swa_active else ""
-        print(f"epoch={epoch:03d}  train={train_loss:.6f}  val={val_loss:.6f}  lr={lr_now:.2e}{marker}")
+        # save checkpoint
+        if epoch % args.save_interval == 0 or epoch == args.epochs:
+            ckpt = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "ema": ema.state_dict() if ema else None,
+                "args": vars(args),
+                # eval_policy.py needs these keys
+                "koopman": args.koopman,
+                "hidden": args.hidden,
+                "depth": args.depth,
+                "scheduler": "cosine",
+                "obs_backbone": "mlp",
+                "obs_norm": obs_norm_state,
+                "act_norm": act_norm_state,
+            }
+            path = os.path.join(args.output_dir, f"ckpt_epoch{epoch}.pt")
+            torch.save(ckpt, path)
+            print(f"  [Save] {path}")
 
-        # SWA 激活判断
-        if not swa_active and epoch >= swa_start:
-            swa_active = True
-            print(f"  >>> SWA started at epoch {epoch}")
-
-        # 保存 best（用 EMA 权重）
-        if val_loss < best:
-            best = val_loss
-            # 用 EMA shadow 权重保存
-            if ema_shadow is not None:
-                ema_shadow.apply_shadow()
-            torch.save(
-                {
-                    "model":     model.state_dict(),
-                    "obs_dim":   x.shape[1],
-                    "act_dim":   y.shape[1],
-                    "algo":      "diffusion_temporal_v1" if args.temporal else "diffusion_v2",
-                    "T":         args.T,
-                    "beta_min":  args.beta_min,
-                    "beta_max":  args.beta_max,
-                    "hidden":    args.hidden,
-                    "depth":     args.depth,
-                    "scheduler": args.scheduler,
-                    "temporal":  args.temporal,
-                    "seq_len":   args.seq_len,
-                    "tf_layers": args.tf_layers,
-                    "tf_heads":  args.tf_heads,
-                    "tf_dropout": args.tf_dropout,
-                     "router_hidden": args.router_hidden,
-                     "obs_backbone": args.obs_backbone,
-                     "rot_pair_dim": rot_pair_dim,
-                     "c4_pair_dim": rot_pair_dim,
-                     "harmonic_order": int(args.harmonic_order),
-                     "obs_norm":  obs_norm.state_dict(),
-                     "act_norm":  act_norm.state_dict(),
-                     "ema_decay": args.ema_decay,
-                 },
-                best_path,
-            )
-            if ema_shadow is not None:
-                ema_shadow.restore()
-
-    # ── SWA 写回（平均权重替换） ─────────────────────────────────────────────
-    if swa_count > 0:
-        print(f"Applying SWA average ({swa_count} updates)...")
-        for name, buf in swa_buffer.items():
-            for pname, p in model.named_parameters():
-                if name == pname:
-                    p.data.copy_(buf / swa_count)
-        torch.save(
-            {
-                "model":     model.state_dict(),
-                "obs_dim":   x.shape[1],
-                "act_dim":   y.shape[1],
-                "algo":      "diffusion_temporal_v1_swa" if args.temporal else "diffusion_v2_swa",
-                "T":         args.T,
-                "beta_min":  args.beta_min,
-                "beta_max":  args.beta_max,
-                "hidden":    args.hidden,
-                "depth":     args.depth,
-                "scheduler": args.scheduler,
-                "temporal":  args.temporal,
-                "seq_len":   args.seq_len,
-                "tf_layers": args.tf_layers,
-                "tf_heads":  args.tf_heads,
-                "tf_dropout": args.tf_dropout,
-                 "router_hidden": args.router_hidden,
-                 "obs_backbone": args.obs_backbone,
-                 "rot_pair_dim": rot_pair_dim,
-                 "c4_pair_dim": rot_pair_dim,
-                 "harmonic_order": int(args.harmonic_order),
-                 "obs_norm":  obs_norm.state_dict(),
-                 "act_norm":  act_norm.state_dict(),
-                 "ema_decay": args.ema_decay,
-                "swa_count": swa_count,
-            },
-            outdir / "swa.pt",
-        )
-
-    # ── 保存训练曲线 ────────────────────────────────────────────────────────
-    with (outdir / "metrics.json").open("w", encoding="utf-8") as f:
-        json.dump({
-            "best_val_loss": best,
-            "train_loss": train_curve,
-            "val_loss": val_curve,
+    # final: save SWA model if used
+    if args.swa and swa_model is not None:
+        # apply EMA shadow to current model before SWA merge (optional)
+        if ema:
+            ema.apply_shadow()
+        # save final
+        final_path = os.path.join(args.output_dir, "ckpt_final.pt")
+        torch.save({
+            "epoch": args.epochs,
+            "model": model.state_dict(),
+            "swa_model": swa_model.state_dict() if args.swa else None,
             "args": vars(args),
-        }, f, indent=2)
+            # eval_policy.py needs these keys
+            "koopman": args.koopman,
+            "hidden": args.hidden,
+            "depth": args.depth,
+            "scheduler": "cosine",
+            "obs_backbone": "mlp",
+            "obs_norm": obs_norm_state,
+            "act_norm": act_norm_state,
+        }, final_path)
+        print(f"  [Final] {final_path}")
 
-    plt.figure(figsize=(8, 5))
-    plt.plot(train_curve, label="train_loss")
-    plt.plot(val_curve,   label="val_loss")
-    plt.xlabel("epoch")
-    plt.ylabel("DDPM noise prediction loss")
-    plt.title("Diffusion Policy v2 Training Curve")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(outdir / "loss_curve.png", dpi=150)
-    plt.close()
-    print(f"Saved best={best_path}  best_val={best:.6f}")
+    print("Training finished.")
 
 
 if __name__ == "__main__":

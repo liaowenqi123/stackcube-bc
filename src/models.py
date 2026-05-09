@@ -1308,3 +1308,454 @@ class BCDiffusionTemporal(BCDiffusion):
                     x = x + c1 * torch.randn_like(x)
         return x
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Deep Koopman-Boosted Diffusion Policy (D3P 风格)
+#  论文：Huang et al. "Improving Robustness to Out-of-Distribution States in
+#        Imitation Learning via Deep Koopman-Boosted Diffusion Policy"
+#        IEEE TRO 2025  https://doi.org/10.1109/TRO.2025.3629819
+#
+#  核心创新（适配 StackCube state-based 版本）：
+#   1. Deep Koopman Operator (DKO) 模块：在潜空间中学习状态序列的线性动力学
+#      - 编码器将观测映射到潜空间 z_t ∈ R^latent_dim
+#      - 动力学：z_{t+h} ≈ K @ z_t + V @ f_u(t)
+#      - 潜动作提取：f_u(t) = L_ψ(z_t)
+#   2. 双分支条件去噪：
+#      - 标准分支：以 obs_emb 为条件（同 v3）
+#      - DKO 分支：以 latent_action f_u 为条件
+#   3. 训练时两个分支同时计算损失，推理时双路生成后平均融合
+#   4. 总损失：L_total = L_ddpm_std + L_ddpm_dko + λ_dko * L_dko + λ_reg * L_reg
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class KoopmanLatentEncoder(nn.Module):
+    """
+    将观测序列编码到潜空间。
+    每步 obs 独立编码后通过注意力池化聚合为单个潜向量。
+    """
+
+    def __init__(self, obs_dim: int, hidden: int = 256, latent_dim: int = 64,
+                 seq_len: int = 8, num_heads: int = 4):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.seq_len = seq_len
+
+        self.obs_proj = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, hidden))
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        # 简化的注意力池化
+        self.query = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
+        self.attn_proj = nn.Linear(hidden, hidden)
+
+        self.out_proj = nn.Sequential(
+            nn.Linear(hidden, latent_dim),
+            nn.LayerNorm(latent_dim),
+        )
+
+    def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
+        """
+        obs_seq: (B, L, obs_dim) — 观测序列
+        返回: (B, latent_dim)
+        """
+        B, L, _ = obs_seq.shape
+        if L > self.seq_len:
+            obs_seq = obs_seq[:, -self.seq_len:, :]
+            L = self.seq_len
+
+        # 每步独立编码
+        h = self.obs_proj(obs_seq.reshape(B * L, -1)).reshape(B, L, -1)
+        # 加位置编码
+        h = h + self.pos_emb[:, :L, :]
+
+        # 注意力池化：以可学习 query 为锚点
+        q = self.query[:, :, :h.size(-1)]  # (1, 1, hidden)
+        attn_scores = torch.matmul(q, h.transpose(-2, -1)) / (h.size(-1) ** 0.5)
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # (1, 1, L)
+        pooled = torch.matmul(attn_weights, h).squeeze(1)  # (B, hidden)
+
+        return self.out_proj(pooled)  # (B, latent_dim)
+
+
+class KoopmanDynamicsModule(nn.Module):
+    """
+    深度 Koopman 算子模块。
+    
+    学习观测序列到潜空间的映射及潜空间中的线性动力系统：
+        z_t = E_φ(obs_seq_t)   — 当前状态编码
+        z_{t+h} = E_φ(obs_seq_{t+h}) — 未来状态编码
+        f_u(t) = L_ψ(z_t)      — 潜动作提取
+        z_pred = K @ z_t + V @ f_u(t) — 线性动力学预测
+        L_dko = MSE(z_pred, z_{t+h})
+    
+    论文中 h=4（采样间隔），通过 stop-gradient 防止 collapse。
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int,
+                 latent_dim: int = 64, hidden: int = 256,
+                 seq_len: int = 8, h: int = 4,
+                 koopman_mu: float = 0.3):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.h = h
+        self.koopman_mu = koopman_mu
+
+        # 观测编码器
+        self.encoder = KoopmanLatentEncoder(
+            obs_dim=obs_dim, hidden=hidden,
+            latent_dim=latent_dim, seq_len=seq_len,
+        )
+
+        # 潜动作网络 L_ψ
+        self.latent_action_net = nn.Sequential(
+            nn.Linear(latent_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, latent_dim),
+        )
+
+        # Koopman 算子和控制矩阵
+        self.K = nn.Parameter(torch.eye(latent_dim) * 0.99 + torch.randn(latent_dim, latent_dim) * 0.01)
+        self.V = nn.Parameter(torch.randn(latent_dim, latent_dim) * 0.02)
+
+    def forward(self, obs_seq: torch.Tensor) -> tuple:
+        """
+        训练前向。
+        obs_seq: (B, L, obs_dim), L >= h + 1
+        返回: (L_dko, f_u, z_t, z_pred)
+        """
+        z_t = self.encoder(obs_seq[:, :-self.h, :])       # (B, latent_dim)
+        z_t_plus_h = self.encoder(obs_seq[:, self.h:, :])  # (B, latent_dim)
+
+        # 计算 predicted next latent
+        f_u = self.latent_action_net(z_t)  # (B, latent_dim)
+        z_pred = torch.matmul(z_t, self.K.T) + torch.matmul(f_u, self.V.T)
+
+        # DKO 损失（含 stop-gradient 技巧，参考论文）
+        loss_dko = torch.nn.functional.mse_loss(z_pred, z_t_plus_h.detach())
+
+        return loss_dko, f_u, z_t, z_pred
+
+    @torch.no_grad()
+    def encode_latent_action(self, obs_seq: torch.Tensor) -> torch.Tensor:
+        """
+        推理时提取潜动作 f_u。
+        与训练一致：使用 obs_seq[:, :-h, :]（前半窗口）。
+        这样 DKO 分支以"稍久远的状态"为条件，
+        与标准分支（当前观测）形成互补。
+        """
+        z = self.encoder(obs_seq[:, :-self.h, :])
+        return self.latent_action_net(z)  # (B, latent_dim)
+
+
+class NoisePredictorKoopman(NoisePredictor):
+    """
+    DKO-boosted 噪声预测器。
+
+    核心思想（论文 "boost" 的正确实现）：
+    - 标准分支：以 obs_emb + t_emb 为条件（同 v3）
+    - DKO 调制：f_u 通过独立的调制器生成额外的 FiLM 参数，
+                叠加到标准分支的 FiLM 输出上，
+                实现"用时序动态信息增强标准分支"
+
+    这不是"双分支独立预测后融合"，而是"单分支 + 条件调制"。
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int,
+                 hidden: int = 384, t_dim: int = 64, depth: int = 6,
+                 latent_dim: int = 64,
+                 obs_backbone: str = "mlp",
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4):
+        super().__init__(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden=hidden,
+            t_dim=t_dim,
+            depth=depth,
+            obs_backbone=obs_backbone,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
+        )
+        # f_u 调制器：为每一层生成额外的 FiLM 参数（gamma_fu, beta_fu）
+        # 这些参数会叠加到标准分支的 FiLM 输出上
+        self.f_u_modulators = nn.ModuleList()
+        for i in range(depth):
+            self.f_u_modulators.append(nn.Sequential(
+                nn.Linear(latent_dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden * 2),  # 输出 gamma_fu, beta_fu
+            ))
+
+    def forward(self,
+                noisy_act: torch.Tensor,
+                t: torch.Tensor,
+                obs: torch.Tensor,
+                f_u: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        前向传播。
+
+        如果 f_u 为 None，则退化为标准 v3（无 DKO 调制）。
+        如果 f_u 不为 None，则用 f_u 调制每一层的 FiLM 输出。
+        """
+        t_e = self.t_emb(t)
+        obs_emb = self.obs_emb(obs)
+        cond = torch.cat([obs_emb, t_e], dim=-1)  # (B, obs_emb_dim + t_dim)
+
+        x = noisy_act
+        for i, (layer, film_mod) in enumerate(zip(self.layers, self.film_mods)):
+            x = layer(x)
+            gam_bet = film_mod(cond)  # (B, hidden * 2)
+            gamma, beta = gam_bet.chunk(2, dim=-1)
+
+            # DKO 调制：f_u 生成额外的 FiLM 参数，叠加到标准分支
+            if f_u is not None:
+                fu_mod = self.f_u_modulators[i](f_u)  # (B, hidden * 2)
+                gamma_fu, beta_fu = fu_mod.chunk(2, dim=-1)
+                gamma = gamma + gamma_fu
+                beta = beta + beta_fu
+
+            x = self.act_fn(x * (1 + gamma) + beta)
+
+        return self.out(x)  # (B, act_dim)
+
+
+class BCDiffusionKoopman(nn.Module):
+    """
+    Deep Koopman-Boosted Diffusion Policy (适配 state-based StackCube)。
+    
+    基于 diffusion v3 (hidden=384, depth=6, cosine scheduler)，新增：
+    1. DKO 模块：在潜空间学习线性动力学
+    2. 双分支条件去噪（训练时双分支同时算 loss，推理时平均融合）
+    
+    参数
+    ----
+    obs_dim, act_dim : 标准化后的维度
+    T                : 扩散步数
+    latent_dim       : DKO 潜空间维度（默认 64，同论文）
+    koopman_h        : DKO 采样间隔（默认 4，同论文）
+    koopman_mu       : DKO 损失平衡系数（默认 0.3，同论文）
+    koopman_lambda   : DKO 损失权重 λ_dko（默认 0.1）
+    reg_lambda       : K/V 正则化权重 λ_reg（默认 1e-5）
+    """
+    _koopman_version = "v1"
+
+    def __init__(self, obs_dim: int, act_dim: int,
+                 T: int = 100,
+                 beta_min: float = 1e-4, beta_max: float = 2e-2,
+                 hidden: int = 384, depth: int = 6,
+                 scheduler: str = "cosine",
+                 latent_dim: int = 64,
+                 koopman_h: int = 4,
+                 koopman_mu: float = 0.3,
+                 koopman_lambda: float = 0.1,
+                 reg_lambda: float = 1e-5,
+                 obs_backbone: str = "mlp",
+                 rot_pair_dim: int | None = None,
+                 harmonic_order: int = 4):
+        super().__init__()
+        self.T = T
+        self.act_dim = act_dim
+        self.scheduler = scheduler
+        self.latent_dim = latent_dim
+        self.koopman_h = koopman_h
+        self.koopman_lambda = koopman_lambda
+        self.reg_lambda = reg_lambda
+        # obs_hist 长度：至少需要 koopman_h*2+1 帧（DKO 需要 >= h+1）
+        self.seq_len = koopman_h * 2 + 1
+
+        # 扩散调度参数
+        self._build_schedule(beta_min, beta_max)
+
+        # 双分支噪声预测器
+        self.noise_pred = NoisePredictorKoopman(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden=hidden,
+            depth=depth,
+            latent_dim=latent_dim,
+            obs_backbone=obs_backbone,
+            rot_pair_dim=rot_pair_dim,
+            harmonic_order=harmonic_order,
+        )
+
+        # DKO 模块
+        self.dko = KoopmanDynamicsModule(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            latent_dim=latent_dim,
+            hidden=hidden,
+            seq_len=koopman_h * 2 + 1,
+            h=koopman_h,
+            koopman_mu=koopman_mu,
+        )
+
+        # DKO 潜动作 → 条件编码的投影（保留，确保维度兼容）
+        self.f_u_proj = nn.Identity()
+
+    def _build_schedule(self, beta_min: float, beta_max: float):
+        """构建扩散调度（同 v3）。"""
+        if self.scheduler == "cosine":
+            steps = self.T + 1
+            s = 0.008
+            t = torch.linspace(0, self.T, steps, dtype=torch.float32) / self.T
+            alphas_cumprod = torch.cos(((t + s) / (1 + s)) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / (alphas_cumprod[0] + 1e-8)
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1]).clamp(max=0.999)
+            betas = torch.cat([betas[:1], betas])
+        else:
+            betas = torch.linspace(beta_min, beta_max, self.T, dtype=torch.float32)
+
+        alphas = 1.0 - betas
+        alpha_bar = torch.cumprod(alphas, dim=0)
+
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alpha_bar", alpha_bar)
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor,
+                 noise: torch.Tensor | None = None) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(x0)
+        ab = self.alpha_bar[t].view(-1, 1)
+        return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+
+    def forward(self,
+                obs: torch.Tensor,
+                act: torch.Tensor,
+                obs_seq: torch.Tensor | None = None,
+                action_noise_std: float = 0.0,
+                disable_dko: bool = False) -> torch.Tensor:
+        """
+        训练前向。
+        obs:     (B, obs_dim) — 当前观测
+        act:     (B, act_dim) — 当前动作
+        obs_seq: (B, L, obs_dim) — 观测序列（用于 DKO），L >= koopman_h + 1
+        disable_dko: True = warmup阶段，只训标准分支，不计算DKO相关损失
+        
+        返回标量训练损失：L_total = L_ddpm + λ_dko * L_dko + λ_reg * L_reg
+        """
+        B = obs.shape[0]
+        device = obs.device
+
+        # ── 1. DKO 损失 ────────────────────────────────────────────────
+        loss_dko = torch.tensor(0.0, device=device)
+        loss_reg = torch.tensor(0.0, device=device)
+        f_u = torch.zeros(B, self.latent_dim, device=device)
+        compute_dko_branch = False
+
+        if not disable_dko and obs_seq is not None and obs_seq.size(1) >= self.koopman_h + 1:
+            loss_dko, f_u, _, _ = self.dko(obs_seq)
+            # K/V 正则化
+            loss_reg = (self.dko.K ** 2).mean() + (self.dko.V ** 2).mean()
+            compute_dko_branch = True
+
+        # ── 2. DDPM 损失（单分支，f_u 调制） ────────────────────────
+        t = torch.randint(0, self.T, (B,), device=device)
+        if action_noise_std > 0:
+            act = act + torch.randn_like(act) * action_noise_std
+        noise = torch.randn_like(act)
+        x_t = self.q_sample(act, t, noise)
+
+        # 单分支：f_u 作为调制条件（如果 compute_dko_branch=True）
+        eps_pred = self.noise_pred(x_t, t, obs, f_u=f_u if compute_dko_branch else None)
+        loss_ddpm = torch.nn.functional.mse_loss(eps_pred, noise)
+
+        # ── 3. 总损失 ────────────────────────────────────────────────────
+        total_loss = loss_ddpm + self.koopman_lambda * loss_dko + self.reg_lambda * loss_reg
+
+        return total_loss
+
+    @torch.no_grad()
+    def ddpm_sample(self, obs: torch.Tensor,
+                    obs_seq: torch.Tensor | None = None,
+                    T_inf: int | None = None,
+                    use_dko: bool = True) -> torch.Tensor:
+        """
+        DDPM 逆向采样。
+
+        use_dko:
+        - True: 使用 f_u 调制（如果 obs_seq 有效）
+        - False: 退化为标准 v3（无 DKO 调制）
+        """
+        T_inf = T_inf or self.T
+        B = obs.shape[0]
+        device = obs.device
+
+        # 提取潜动作 f_u（如果启用 DKO）
+        f_u = None
+        if use_dko and obs_seq is not None and obs_seq.size(1) >= 2:
+            f_u = self.dko.encode_latent_action(obs_seq)
+
+        x = torch.randn(B, self.act_dim, device=device)
+        for i in reversed(range(T_inf)):
+            t_batch = torch.full((B,), i, device=device, dtype=torch.long)
+            # 单分支：f_u 作为调制条件（如果 f_u 为 None，退化为标准 v3）
+            eps = self.noise_pred(x, t_batch, obs, f_u=f_u)
+            beta_t = self.betas[i]
+            alpha_t = self.alphas[i]
+            ab_t = self.alpha_bar[i]
+            coef = beta_t / (1 - ab_t).sqrt()
+            mean = (x - coef * eps) / alpha_t.sqrt()
+            if i > 0:
+                x = mean + beta_t.sqrt() * torch.randn_like(x)
+            else:
+                x = mean
+        return x
+
+    @torch.no_grad()
+    def ddim_sample(self, obs: torch.Tensor,
+                    obs_seq: torch.Tensor | None = None,
+                    T_inf: int = 20, eta: float = 0.0,
+                    use_dko: bool = True) -> torch.Tensor:
+        """DDIM 采样（单分支 + f_u 调制）。"""
+        B = obs.shape[0]
+        device = obs.device
+
+        # 提取潜动作 f_u（如果启用 DKO）
+        f_u = None
+        if use_dko and obs_seq is not None and obs_seq.size(1) >= 2:
+            f_u = self.dko.encode_latent_action(obs_seq)
+
+        step_size = self.T // T_inf
+        timesteps = list(range(self.T - 1, -1, -step_size))[:T_inf]
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        def _ddim_step(x, eps_pred, cur_t, nxt_t):
+            ab_t = self.alpha_bar[cur_t]
+            ab_tn = self.alpha_bar[nxt_t]
+            pred_x0 = (x - (1 - ab_t).sqrt() * eps_pred) / ab_t.sqrt().clamp(min=1e-8)
+            direction = (x - ab_t.sqrt() * pred_x0) / (1 - ab_t).sqrt().clamp(min=1e-8)
+            if eta == 0.0:
+                return ab_tn.sqrt() * pred_x0 + (1 - ab_tn).sqrt() * direction
+            beta_tn = self.betas[nxt_t]
+            c1 = eta * ((1 - ab_tn / ab_t).clamp(min=0) * (1 - ab_t) / (1 - ab_tn)).sqrt() * beta_tn.sqrt()
+            x_new = ab_tn.sqrt() * pred_x0 + ((1 - ab_tn) - c1 ** 2).clamp(min=0).sqrt() * direction
+            if nxt_t > 0:
+                x_new = x_new + c1 * torch.randn_like(x_new)
+            return x_new
+
+        x = torch.randn(B, self.act_dim, device=device)
+        for idx in range(len(timesteps) - 1):
+            t_cur, t_next = timesteps[idx], timesteps[idx + 1]
+            t_batch = torch.full((B,), t_cur, device=device, dtype=torch.long)
+            # 单分支：f_u 作为调制条件
+            eps = self.noise_pred(x, t_batch, obs, f_u=f_u)
+            x = _ddim_step(x, eps, t_cur, t_next)
+
+        return x
+
+
+# 兼容性别名
+class BCDiffusionKoopmanV1(BCDiffusionKoopman):
+    """BCDiffusionKoopman = BCDiffusionKoopmanV1"""
+    pass
+

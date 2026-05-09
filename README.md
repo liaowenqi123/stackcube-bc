@@ -95,6 +95,7 @@ python src\train_bcrnn.py `
 | diffusion v1 | 基础 DDPM/DDIM diffusion policy | `outputs/diffusion` |
 | diffusion v2 | 容量增大 + cosine + EMA + action noise + SWA | `outputs/diffusion_v2` |
 | diffusion v3 | v2 进一步调参与训练策略迭代 | `outputs/diffusion_v3` |
+| diffusion v3 Koopman | D3P风格：DKO模块+双分支条件去噪+test-time loss融合 | `outputs/diffusion_v3_koopman` |
 | temporal diffusion | `--temporal` + Transformer 时序分支 | `outputs/diffusion_temporal_*` |
 | v1 + C4/C8 | 非时序 v1 + 离散旋转不变骨干 | `outputs/diffusion_v1_c8`（默认脚本） |
 | v1 + SE2 | 非时序 v1 + 连续参数化 SE(2) steerable 骨干 | `outputs/diffusion_v1_se2_e200` |
@@ -178,6 +179,9 @@ python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.np
 
 # v1 + harmonic（复数谐波骨干）
 python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_v1_harmonic_e200 --epochs 200 --batch-size 512 --lr 1e-4 --obs-backbone harmonic --rot-pair-dim -1 --harmonic-order 4 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 180
+
+# diffusion v3 Koopman（D3P风格，单行bat）
+python src\train_bcdiffusion.py --dataset .\data\processed\stackcube_rl_state.npz --outdir .\outputs\diffusion_v3_koopman --epochs 500 --batch-size 512 --lr 1e-4 --koopman --seq-len 9 --hidden 384 --depth 6 --scheduler cosine --ema-decay 0.999 --action-noise-std 0.01 --swa-start 450 --latent-dim 64 --koopman-h 4 --koopman-lambda 0.1 --koopman-reg 1e-5
 ```
 
 ### 评估命令模板（所有 diffusion 版本通用）
@@ -197,6 +201,12 @@ python src\eval_policy.py `
 ```
 
 > 如果目录里没有 `swa.pt`，把 `--ckpt` 改成 `best.pt`。
+
+### diffusion v3 Koopman 评估（单行bat）
+
+```powershell
+python src\eval_policy.py --algo diffusion --ckpt .\outputs\diffusion_v3_koopman\swa.pt --episodes 100 --output-dir .\outputs\eval_diffusion_v3_koopman --max-steps 400 --sampler ddim --T-inf 20 --eta 0.0 --save-gif --gif-episodes 3
+```
 
 ### 当前已跑训练的 best_val_loss（便于横向看收敛）
 
